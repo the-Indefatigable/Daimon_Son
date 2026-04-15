@@ -22,6 +22,7 @@ from tools.development.github_reader import (
     GitHubListFiles, GitHubListRepos, GitHubReadFile, GitHubRecentCommits,
     GitHubRepoInfo,
 )
+from tools.development.self_pr import GitHubProposePR
 from tools.general.inbox import ReadInbox
 from tools.general.notifier import TelegramNotifier
 from tools.general.private_memory import InternMemory, PrivateRecall, PrivateWrite
@@ -75,6 +76,8 @@ class Agent:
         self.tools.register(GitHubListFiles())
         self.tools.register(GitHubReadFile())
         self.tools.register(GitHubRecentCommits())
+        # Phase 3 — self-PR (scoped only to Daimon_Son)
+        self.tools.register(GitHubProposePR())
         # Phase 2 — Twitter (stub-safe if keys missing)
         self.tools.register(TwitterPost())
         self.tools.register(TwitterReadTimeline())
