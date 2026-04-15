@@ -88,6 +88,13 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+GITHUB_PAT = os.getenv("GITHUB_PAT")
+
+# Repo pointers — comma-separated owner/name strings. Empty = DAIMON discovers
+# via github_list_repos if PAT is set.
+GITHUB_REPOS = [
+    r.strip() for r in os.getenv("GITHUB_REPOS", "").split(",") if r.strip()
+]
 
 # ---------- Reflection / scheduling ----------
 REFLECTION_INTERVAL_HOURS = 24

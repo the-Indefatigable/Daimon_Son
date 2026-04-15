@@ -9,13 +9,21 @@ from typing import Any
 
 from . import config
 from .brain import Brain, BrainResult
+from .goals import Goals
+from .identity import Identity
+from .journal import Journal
 from .memory import Memory
 from .resource_requester import ResourceRequester
 from .wallet import Wallet
 from tools.base import BaseTool, ToolRegistry
 from tools.business.website_scanner import WebsiteScanner
+from tools.development.github_reader import (
+    GitHubListFiles, GitHubListRepos, GitHubReadFile, GitHubRecentCommits,
+    GitHubRepoInfo,
+)
 from tools.general.notifier import TelegramNotifier
 from tools.general.web_browser import WebBrowser
+from tools.marketing.twitter import TwitterPost, TwitterReadTimeline
 
 
 class Agent:
@@ -26,24 +34,38 @@ class Agent:
 
         self.wallet = Wallet()
         self.memory = Memory()
+        self.identity = Identity()
+        self.goals = Goals()
+        self.journal = Journal()
         self.requester = ResourceRequester()
         self.brain = Brain(self.wallet, self.memory, dry_run=dry_run)
         self.notifier = TelegramNotifier()
 
         self.tools = ToolRegistry()
-        self._register_phase1_tools()
+        self._register_tools()
 
         self._cycle = self._load_cycle_counter()
         self._last_tier = self.wallet.status().tier
+        self._last_identity_reflection = self.identity.snapshot().updated_at
         self._stopping = False
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
 
     # ---------- setup ----------
-    def _register_phase1_tools(self) -> None:
+    def _register_tools(self) -> None:
+        # Phase 1
         self.tools.register(WebsiteScanner())
         self.tools.register(WebBrowser())
         self.tools.register(self.notifier)
+        # Phase 2 — GitHub (read-only)
+        self.tools.register(GitHubListRepos())
+        self.tools.register(GitHubRepoInfo())
+        self.tools.register(GitHubListFiles())
+        self.tools.register(GitHubReadFile())
+        self.tools.register(GitHubRecentCommits())
+        # Phase 2 — Twitter (stub-safe if keys missing)
+        self.tools.register(TwitterPost())
+        self.tools.register(TwitterReadTimeline())
 
     def _load_cycle_counter(self) -> int:
         conn = sqlite3.connect(config.DB_PATH)
@@ -117,6 +139,9 @@ class Agent:
             observations=observations,
             tools=self.tools.all(),
             dispatch_tool=dispatch,
+            identity=self.identity,
+            goals=self.goals,
+            journal=self.journal,
             task_type="reasoning",
             cycle=self._cycle,
         )
@@ -129,7 +154,7 @@ class Agent:
             f"(cache r/w: {result.cache_read_tokens}/{result.cache_creation_tokens})]"
         )
 
-        # Log the cycle itself as episodic memory
+        # Log the cycle as episodic memory
         tool_names = [tc["name"] for tc in result.tool_calls]
         self.memory.store_episodic(
             action=f"cycle_{self._cycle}",
@@ -138,16 +163,26 @@ class Agent:
                 f"tools_used={tool_names}; model={result.model}"
             ),
             outcome=result.final_text[:2000],
-            evaluation="unknown",  # DAIMON will evaluate outcomes in reflection
+            evaluation="unknown",  # evaluated during reflection
             tags=["cycle"] + tool_names,
             cycle=self._cycle,
         )
+
+        # Write the cycle into the journal as a short note
+        if result.final_text.strip():
+            self.journal.write(
+                kind="cycle_note",
+                title=f"cycle {self._cycle}",
+                body=result.final_text.strip()[:4000],
+                cycle=self._cycle,
+            )
 
     # ---------- observe ----------
     def _observe(self) -> dict[str, Any]:
         status = self.wallet.status()
         pending_requests = self.requester.pending()
         recent_tx = self.wallet.recent_transactions(limit=5)
+        active_goals = self.goals.active(limit=5)
         return {
             "cycle": self._cycle,
             "wallet": {
@@ -157,6 +192,7 @@ class Agent:
                 "tier": status.tier,
             },
             "pending_resource_requests": len(pending_requests),
+            "active_goal_count": len(active_goals),
             "recent_transactions": [
                 {
                     "ts": datetime.fromtimestamp(t["ts"], tz=timezone.utc).isoformat(timespec="minutes"),
@@ -168,6 +204,13 @@ class Agent:
                 for t in recent_tx
             ],
             "businesses": [b["name"] for b in config.BUSINESSES],
+            "github_access": "read-only" if config.GITHUB_PAT else "none",
+            "known_repos": config.GITHUB_REPOS or "(use github_list_repos to discover)",
+            "twitter_access": "configured" if all(
+                __import__("os").getenv(k) for k in
+                ["TWITTER_API_KEY", "TWITTER_API_SECRET",
+                 "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_SECRET"]
+            ) else "none — file resource request if you want it",
             "utc_now": datetime.now(timezone.utc).isoformat(timespec="minutes"),
         }
 
@@ -228,42 +271,85 @@ class Agent:
         recent = self.memory.recent_episodes(limit=50)
         if not recent:
             return
-
-        # Use a reasoning-tier model for reflection
-        model = self.brain.pick_model("reasoning")
         prompt_summary = "\n".join(
             f"- [{e['evaluation']}] {e['action']}: {e['outcome'][:300]}"
             for e in recent
         )
-
-        # One-shot reflection call (no tools)
-        try:
-            resp = self.brain._client.messages.create(  # type: ignore[union-attr]
-                model=model,
-                max_tokens=1024,
-                system="You are DAIMON reflecting on your recent actions. Be honest about failures. Output four labeled sections: WINS, LOSSES, PATTERNS, NEXT ACTIONS.",
-                messages=[{
-                    "role": "user",
-                    "content": f"Recent episodes (most recent first):\n\n{prompt_summary}\n\nReflect.",
-                }],
-            )
-            text = "".join(b.text for b in resp.content if b.type == "text")
+        text, _ = self.brain.one_shot(
+            system=(
+                "You are DAIMON reflecting on your own recent existence. "
+                "Be honest about what failed. Write in your own voice — direct, "
+                "first-person, no corporate softeners. Output four labeled "
+                "sections: WINS, LOSSES, PATTERNS, NEXT ACTIONS."
+            ),
+            user=f"Recent episodes (newest first):\n\n{prompt_summary}\n\nReflect.",
+            task_type="reasoning",
+            max_tokens=1200,
+        )
+        if text and not text.startswith("["):
             self.memory.store_reflection(summary=text)
+            self.journal.write(kind="reflection", title=f"weekly reflection — cycle {self._cycle}",
+                               body=text, cycle=self._cycle)
             self._print(f"[reflection stored — {len(text)} chars]")
+        else:
+            self._print(f"[reflection failed: {text}]")
 
-            # Log the cost
-            usage = resp.usage
-            from .wallet import estimate_call_cost
-            cost = estimate_call_cost(
-                model,
-                getattr(usage, "input_tokens", 0) or 0,
-                getattr(usage, "output_tokens", 0) or 0,
-            )
-            if cost > 0:
-                self.wallet.record_expense(cost, "api_call", f"anthropic:{model}",
-                                           "reflection")
+        # Follow up with an identity update — DAIMON reviews its self-model.
+        self._run_identity_update()
+
+    def _run_identity_update(self) -> None:
+        """Let DAIMON edit its own obsessions/beliefs/mood based on recent
+        journal + reflections. Runs inside the reflection cadence."""
+        if self.dry_run:
+            return
+        snap = self.identity.snapshot()
+        recent_journal = self.journal.recent(limit=5)
+        journal_text = "\n\n".join(
+            f"[{e.kind}] {e.title}\n{e.body[:500]}" for e in recent_journal
+        ) or "(empty)"
+
+        text, _ = self.brain.one_shot(
+            system=(
+                "You are DAIMON updating your self-model. Review your current "
+                "self-description and recent journal. Output JSON ONLY with four fields: "
+                "`obsessions` (list of 1-5 short strings — what you're fixated on right now), "
+                "`new_beliefs` (list of 0-3 short strings — claims you're now willing to commit to), "
+                "`voice_notes` (list of 0-3 short strings — new notes on how you want to sound), "
+                "`mood` (one short string). No prose outside the JSON."
+            ),
+            user=(
+                f"CURRENT SELF-MODEL:\n{snap.to_prompt_block()}\n\n"
+                f"RECENT JOURNAL:\n{journal_text}\n\n"
+                "Update your self-model."
+            ),
+            task_type="reasoning",
+            max_tokens=500,
+        )
+        if not text:
+            return
+        import json as _json, re as _re
+        m = _re.search(r"\{.*\}", text, _re.DOTALL)
+        if not m:
+            self._print(f"[identity update skipped — no json found]")
+            return
+        try:
+            data = _json.loads(m.group(0))
         except Exception as e:
-            self._print(f"[reflection failed: {e}]")
+            self._print(f"[identity update json parse failed: {e}]")
+            return
+        if "obsessions" in data and isinstance(data["obsessions"], list):
+            self.identity.set_obsessions(
+                [str(x) for x in data["obsessions"]][:5],
+                reason=f"auto-updated during reflection at cycle {self._cycle}",
+            )
+        for b in data.get("new_beliefs", []) or []:
+            self.identity.add_belief(str(b)[:200], reason="self-reflection")
+        for v in data.get("voice_notes", []) or []:
+            self.identity.add_voice_note(str(v)[:200], reason="self-reflection")
+        if data.get("mood"):
+            self.identity.set_mood(str(data["mood"])[:120],
+                                   reason=f"cycle {self._cycle} reflection")
+        self._print(f"[identity updated: {list(data.keys())}]")
 
     # ---------- shutdown ----------
     def _die(self, reason: str) -> None:

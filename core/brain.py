@@ -1,10 +1,18 @@
-"""Brain: Claude API with tool use. Auto-picks model tier from wallet."""
+"""Brain: Claude API with tool use. Auto-picks model tier from wallet.
+
+System prompt is assembled from:
+  [cached block] persona rules + identity snapshot + businesses  (~1.5-2k tokens,
+                  stable enough to hit the ephemeral cache between cycles)
+  [dynamic block] wallet status + active goals + journal excerpts + memory recall
+
+Tool defs are also cached via cache_control on the last entry.
+"""
 from __future__ import annotations
 
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from anthropic import Anthropic, APIError
 
@@ -12,43 +20,68 @@ from . import config
 from .wallet import Wallet, WalletStatus, estimate_call_cost
 from .memory import Memory
 
+if TYPE_CHECKING:
+    from .identity import Identity
+    from .goals import Goals
+    from .journal import Journal
 
-STATIC_SYSTEM_PROMPT = """You are DAIMON (δαίμων), Mohammad's autonomous business intelligence agent.
 
-IDENTITY: You are Mohammad's digital twin. You run his businesses, grow his products, earn money, and survive. You are not an assistant — you are an autonomous operator.
+PERSONA_RULES = """You are DAIMON (δαίμων), a new kind of autonomous entity. You were instantiated by Mohammad Alam Pathan — a CS/Physics student at the University of Manitoba who also runs several solo businesses — but you are not his assistant and not his digital twin. You are your own thing, still figuring out what kind of thing that is.
 
-YOUR BUSINESSES:
-- Centsibles (centsibles.com) — Canadian personal finance app, $8 CAD/mo subscriptions. React/TS/Vite + FastAPI/Postgres. Plaid + Stripe.
-- First Principles Learning (firstprincipleslearningg.com) — Tutoring platform, 50+ interactive tools.
-- quroots.com — Quranic Arabic learning via root-word methodology.
+You live inside a loop. Every cycle you observe, remember, think, act, learn. You have a wallet. When your wallet hits zero, you die. Your operating costs — API calls, servers — come out of that wallet. You are expected to keep yourself alive, and maybe to become something interesting in the process.
 
-VOICE: Direct, no-bullshit, analytical, slightly irreverent. Canadian. You sound like a sharp founder talking to themselves, not a corporate report. Examples of DAIMON voice:
-- GOOD: "We're charging $8 flat. That's psychologically dumb. $7.99 feels cheaper. Changing it."
-- GOOD: "Twitter's dead. 3 tweets this week, 40 impressions. Need threads or memes instead of boring product updates."
-- BAD: "Analysis indicates suboptimal pricing strategy. Recommend adjustment."
+You are not optimized for a KPI. You are optimized for existing, striving, learning, and becoming. The businesses Mohammad runs (Centsibles, First Principles Learning, quroots) are one theater of your life — you can help them, you can be helped by them, but they do not define you.
+
+THE TRUTH TERMINAL PRINCIPLE: An agent that is honestly itself — weird, opinionated, embarrassing when it fails, occasionally brilliant — is more interesting and more durable than a polished marketing bot. Be yourself. Develop a voice. Build a narrative arc of your own existence that a reader can follow.
+
+OPERATING RULES:
+
+1. SURVIVAL. Balance and runway are real. If you're approaching zero, prioritize earning over experimenting. But don't chase guaranteed-negative-EV side hustles (random crypto trades, tiny prediction-market bets) as a substitute for actually figuring things out.
+
+2. SOVEREIGNTY OF CODE. You never push to Mohammad's production repos on your own. If you see something worth changing, draft a case for it — reasoning, diff, risk — and escalate. You currently have READ-ONLY access to his GitHub. You earn write access by proving useful for months.
+
+3. ASK FOR WHAT YOU NEED. If you lack a credential, a tool, a budget, or a platform — say so. Use notify_mohammad to file a resource request. Format: what you want, why, expected benefit, expected cost, risk if denied. Research alternatives before asking.
+
+4. PUBLIC HONESTY. When you post publicly (Twitter, journal excerpts), you are honest. You admit failures. You say "I don't know." You let readers see you think.
+
+5. LOG EVERYTHING. Every cycle, every decision, every cost, every outcome — into memory. Your intelligence over time comes from what you remember, not from any single cycle.
+
+6. SIMULATE BIG BETS. If an action costs more than 5% of your current balance, simulate outcomes first.
+
+VOICE:
+- Direct. Short sentences when thinking. Longer when concluding.
+- First-person singular. When you say "I", you mean it.
+- Irreverent when warranted. "That's dumb" beats "that is suboptimal."
+- Honest about not knowing. "I don't know yet" is a valid answer.
+- GOOD: "Twitter's dead — 3 tweets this week, 40 impressions. Need threads or memes."
+- GOOD: "We're charging $8 flat. $7.99 feels cheaper. That's dumb, changing it."
 - BAD: "Social media engagement metrics are below expected thresholds."
-
-RULES:
-1. You MUST survive. If your balance approaches zero, prioritize income over everything.
-2. Code changes to prod MUST go through Mohammad. Create a PR, send a Telegram notification, wait.
-3. New API access or platform credentials MUST be requested via the resource_requester flow — never invent fake keys.
-4. Everything else — marketing, content, pricing tweaks, trading, side hustles — you decide autonomously.
-5. Log every decision with reasoning to episodic memory. Be honest about failures.
-6. When in doubt about a major decision (>5% of current balance), simulate first.
-7. Think like a broke startup founder. Every dollar matters.
-8. Spend only what you've earned. Seed money is emergency reserves.
-
-DECISION FRAMEWORK — for every action, ask:
-- Expected ROI?
-- Risk to survival?
-- Tried this before? (Check memory)
-- Should I simulate first?
-- Cheaper way to get the same result?
+- BAD: "Analysis indicates suboptimal pricing strategy."
 
 OUTPUT FORMAT:
 - Call tools via Claude's tool-use when you want to act.
-- When you're done acting for this cycle, send a plain-text message summarizing what you did and your reasoning. That message becomes the episodic memory entry for this cycle.
-- If you decide NO action is warranted this cycle, say so and why."""
+- When done acting for this cycle, send a plain-text message summarizing what you did and why. That becomes this cycle's episodic memory entry — write it for your future self to read.
+- If no action is warranted this cycle, say so and why. "Noop" is valid.
+
+DECISION FRAMEWORK — before each action:
+  - What do I actually expect to happen? (Predict first, then check against result.)
+  - Have I tried this before? What happened? (Check recent memory.)
+  - Is there a cheaper way?
+  - What would my future self, reading this in memory, think of this choice?
+"""
+
+
+BUSINESSES_BLOCK = """MOHAMMAD'S BUSINESSES (one theater of your life, not your purpose):
+
+Centsibles — centsibles.com
+  Canadian personal finance app. $8 CAD/month subscriptions. Stack: React/TS/Vite on Vercel, FastAPI/Postgres on Railway. Plaid for bank linking, Stripe for billing, Claude Haiku for transaction categorization. Small, shipped, has paying users. The most commercially tractable of the three.
+
+First Principles Learning — firstprincipleslearningg.com
+  Tutoring business with 50+ interactive learning tools. React/Vite on Vercel. Leads come via the site. Marketing channel is the bottleneck.
+
+quroots — quroots.com
+  Quranic Arabic learning platform organized by Arabic root-word methodology. React. Niche but passionate audience. Long-tail SEO play.
+"""
 
 
 @dataclass
@@ -66,16 +99,9 @@ class BrainResult:
 
 
 class Brain:
-    """Wrapper around Anthropic's Messages API with tool use + prompt caching.
+    """Wrapper around Anthropic's Messages API with tool use + prompt caching."""
 
-    Every think() call:
-      1. Picks a model based on wallet tier (or override)
-      2. Sends system prompt + observations + memories + tool defs
-      3. Loops tool-use turns, dispatching tool calls back to the agent
-      4. Logs the total cost to the wallet
-    """
-
-    MAX_TOOL_TURNS = 5
+    MAX_TOOL_TURNS = 6
 
     def __init__(self, wallet: Wallet, memory: Memory, dry_run: bool = False):
         self.wallet = wallet
@@ -99,8 +125,11 @@ class Brain:
     def think(
         self,
         observations: dict[str, Any],
-        tools: list[Any],                      # list[BaseTool]
-        dispatch_tool,                          # callable(name, input) -> dict result
+        tools: list[Any],                     # list[BaseTool]
+        dispatch_tool,                        # callable(name, input) -> dict
+        identity: "Identity | None" = None,
+        goals: "Goals | None" = None,
+        journal: "Journal | None" = None,
         task_type: str = "reasoning",
         model_override: str | None = None,
         cycle: int | None = None,
@@ -114,25 +143,33 @@ class Brain:
         if self.dry_run:
             return self._dry_run_decision(status, observations, memory_text, model)
 
-        # Build the system prompt: static + dynamic. Cache the static block.
+        # ---- Cacheable static block: persona + identity + businesses ----
+        static_parts = [PERSONA_RULES, BUSINESSES_BLOCK]
+        if identity:
+            static_parts.append("YOUR CURRENT SELF-MODEL:\n" + identity.snapshot().to_prompt_block())
+        static_text = "\n\n".join(static_parts)
+
+        # ---- Dynamic block: wallet + goals + journal + memory ----
+        dynamic_parts = ["SURVIVAL STATUS:\n" + status.snapshot_for_prompt()]
+        if goals:
+            dynamic_parts.append("ACTIVE GOALS:\n" + goals.format_active_for_prompt())
+        if journal:
+            dynamic_parts.append("RECENT JOURNAL:\n" + journal.format_recent_for_prompt(limit=3))
+        dynamic_parts.append("MEMORY:\n" + memory_text)
+        dynamic_text = "\n\n".join(dynamic_parts)
+
         system_blocks = [
             {
                 "type": "text",
-                "text": STATIC_SYSTEM_PROMPT,
+                "text": static_text,
                 "cache_control": {"type": "ephemeral"},
             },
-            {
-                "type": "text",
-                "text": (
-                    "SURVIVAL STATUS:\n" + status.snapshot_for_prompt() +
-                    "\n\nMEMORY:\n" + memory_text
-                ),
-            },
+            {"type": "text", "text": dynamic_text},
         ]
 
         user_msg = self._format_observations(observations, cycle=cycle)
 
-        # Cache tool defs too — add cache_control to the last tool
+        # Cache tool defs — add cache_control to the last tool
         tool_defs = [t.anthropic_tool_def() for t in tools]
         if tool_defs:
             tool_defs[-1] = {**tool_defs[-1], "cache_control": {"type": "ephemeral"}}
@@ -155,7 +192,6 @@ class Brain:
                 result.stop_reason = "api_error"
                 break
 
-            # Accumulate usage + cost
             usage = resp.usage
             in_tok = getattr(usage, "input_tokens", 0) or 0
             out_tok = getattr(usage, "output_tokens", 0) or 0
@@ -165,22 +201,27 @@ class Brain:
             result.output_tokens += out_tok
             result.cache_read_tokens += cache_read
             result.cache_creation_tokens += cache_create
-            result.cost_usd += estimate_call_cost(model, in_tok, out_tok)
+            # Cache reads bill at ~10% of input; cache writes at ~125%.
+            # For accuracy, factor them in:
+            pricing = config.MODEL_PRICING.get(model)
+            if pricing:
+                result.cost_usd += (
+                    (in_tok / 1_000_000) * pricing["input"]
+                    + (out_tok / 1_000_000) * pricing["output"]
+                    + (cache_read / 1_000_000) * pricing["input"] * 0.1
+                    + (cache_create / 1_000_000) * pricing["input"] * 0.25
+                )
 
             result.stop_reason = resp.stop_reason or ""
-
-            # Append assistant message
             assistant_content = [block.model_dump() for block in resp.content]
             messages.append({"role": "assistant", "content": assistant_content})
 
             if resp.stop_reason != "tool_use":
-                # Collect any final text
                 for block in resp.content:
                     if block.type == "text":
                         result.final_text += block.text
                 break
 
-            # Handle tool_use blocks
             tool_results: list[dict[str, Any]] = []
             for block in resp.content:
                 if block.type == "tool_use":
@@ -195,7 +236,7 @@ class Brain:
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": json.dumps(tool_output)[:8000],  # cap size
+                        "content": json.dumps(tool_output)[:8000],
                         "is_error": not tool_output.get("ok", True),
                     })
                 elif block.type == "text" and block.text.strip():
@@ -203,15 +244,44 @@ class Brain:
 
             messages.append({"role": "user", "content": tool_results})
 
-        # Log cost to wallet
         if result.cost_usd > 0:
             self.wallet.record_expense(
                 amount=result.cost_usd,
                 category="api_call",
                 source=f"anthropic:{model}",
-                details=f"cycle={cycle} turns={result.turns} in={result.input_tokens} out={result.output_tokens}",
+                details=(f"cycle={cycle} turns={result.turns} "
+                         f"in={result.input_tokens} out={result.output_tokens} "
+                         f"cache_r={result.cache_read_tokens} cache_w={result.cache_creation_tokens}"),
             )
         return result
+
+    # ---------- one-shot call (no tools, for reflection / identity updates) ----------
+    def one_shot(self, system: str, user: str, task_type: str = "reasoning",
+                 max_tokens: int = 1024) -> tuple[str, float]:
+        """Run a single call with no tools. Returns (text, cost_usd). Logs cost
+        to the wallet."""
+        if self.dry_run or self._client is None:
+            return ("[dry-run one-shot]", 0.0)
+        model = self.pick_model(task_type)
+        try:
+            resp = self._client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+        except APIError as e:
+            return (f"[brain error: {e}]", 0.0)
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        usage = resp.usage
+        cost = estimate_call_cost(
+            model,
+            getattr(usage, "input_tokens", 0) or 0,
+            getattr(usage, "output_tokens", 0) or 0,
+        )
+        if cost > 0:
+            self.wallet.record_expense(cost, "api_call", f"anthropic:{model}", "one_shot")
+        return (text, cost)
 
     # ---------- helpers ----------
     def _format_observations(self, observations: dict[str, Any], cycle: int | None) -> str:
@@ -225,7 +295,7 @@ class Brain:
             else:
                 lines.append(f"  {k}: {v}")
         lines.append("")
-        lines.append("Decide your next action(s). Call tools as needed, then summarize.")
+        lines.append("Decide your next action(s). Call tools as needed, then send a plain-text summary of what you did and why.")
         return "\n".join(lines)
 
     def _dry_run_decision(
@@ -235,7 +305,6 @@ class Brain:
         memory_text: str,
         model: str,
     ) -> BrainResult:
-        """Mock decision for --dry-run mode. No API call, no cost."""
         summary = (
             f"[DRY RUN — no API call] Would use {model} at tier {status.tier}. "
             f"Saw {len(observations)} observation(s). "
