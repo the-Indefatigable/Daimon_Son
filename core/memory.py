@@ -18,6 +18,7 @@ class Memory:
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
+        self._migrate()
         self._ensure_identity()
 
     def _init_schema(self) -> None:
@@ -32,10 +33,20 @@ class Memory:
                 outcome TEXT,
                 evaluation TEXT,         -- 'success' | 'failure' | 'neutral' | 'unknown'
                 lesson TEXT,
-                tags TEXT                -- comma-separated
+                tags TEXT,               -- comma-separated
+                tier TEXT DEFAULT 'st',  -- 'st' = short-term, 'lt' = long-term (habit)
+                access_count INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_ep_ts ON episodic(ts);
             CREATE INDEX IF NOT EXISTS idx_ep_eval ON episodic(evaluation);
+
+            CREATE TABLE IF NOT EXISTS private_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                cycle INTEGER,
+                content BLOB NOT NULL      -- DAIMON writes whatever it wants here
+            );
+            CREATE INDEX IF NOT EXISTS idx_pm_ts ON private_memory(ts);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS episodic_fts
                 USING fts5(action, details, outcome, lesson, content='episodic', content_rowid='id');
@@ -74,6 +85,17 @@ class Memory:
             );
             """
         )
+
+    def _migrate(self) -> None:
+        """Additive migrations for existing databases."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(episodic)")}
+        if "tier" not in cols:
+            self._conn.execute("ALTER TABLE episodic ADD COLUMN tier TEXT DEFAULT 'st'")
+        if "access_count" not in cols:
+            self._conn.execute(
+                "ALTER TABLE episodic ADD COLUMN access_count INTEGER DEFAULT 0"
+            )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_tier ON episodic(tier)")
 
     def _ensure_identity(self) -> None:
         defaults = {
@@ -120,6 +142,77 @@ class Memory:
             "SELECT * FROM episodic ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- tiering (human-like memory) ----------
+    def touch_episode(self, episode_id: int) -> None:
+        """DAIMON recalled this. If accessed 3+ times, auto-promote to long-term."""
+        self._conn.execute(
+            "UPDATE episodic SET access_count = access_count + 1 WHERE id = ?",
+            (episode_id,),
+        )
+        row = self._conn.execute(
+            "SELECT access_count, tier FROM episodic WHERE id = ?", (episode_id,)
+        ).fetchone()
+        if row and row["tier"] == "st" and row["access_count"] >= 3:
+            self._conn.execute(
+                "UPDATE episodic SET tier='lt' WHERE id = ?", (episode_id,)
+            )
+
+    def intern_episode(self, episode_id: int, reason: str = "") -> bool:
+        """DAIMON explicitly promotes something to long-term memory (habit)."""
+        cur = self._conn.execute(
+            "UPDATE episodic SET tier='lt' WHERE id=? AND tier='st'", (episode_id,)
+        )
+        if cur.rowcount and reason:
+            self._conn.execute(
+                "UPDATE episodic SET lesson = COALESCE(lesson,'') || ? WHERE id=?",
+                (f" [interned: {reason}]", episode_id),
+            )
+        return bool(cur.rowcount)
+
+    def expire_short_term(self, days: int = 14) -> int:
+        """Forget short-term episodes older than N days that were never promoted.
+        Run during reflection. Returns count deleted."""
+        cutoff = time.time() - days * 86400
+        cur = self._conn.execute(
+            "DELETE FROM episodic WHERE tier='st' AND ts < ?", (cutoff,)
+        )
+        return cur.rowcount or 0
+
+    def long_term_episodes(self, limit: int = 20) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM episodic WHERE tier='lt' "
+            "ORDER BY access_count DESC, ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- private memory (DAIMON's own notebook) ----------
+    def private_write(self, content: str, cycle: int | None = None) -> int:
+        """DAIMON writes whatever it wants here. We don't inspect content."""
+        cur = self._conn.execute(
+            "INSERT INTO private_memory (ts, cycle, content) VALUES (?, ?, ?)",
+            (time.time(), cycle, content.encode("utf-8")),
+        )
+        return cur.lastrowid
+
+    def private_recent(self, limit: int = 10) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT id, ts, cycle, content FROM private_memory "
+            "ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                content = r["content"].decode("utf-8", errors="replace") \
+                    if isinstance(r["content"], (bytes, bytearray)) else str(r["content"])
+            except Exception:
+                content = repr(r["content"])
+            out.append({"id": r["id"], "ts": r["ts"], "cycle": r["cycle"], "content": content})
+        return out
+
+    def private_count(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS c FROM private_memory").fetchone()
+        return int(row["c"]) if row else 0
 
     def search_episodes(self, query: str, limit: int = 10) -> list[dict]:
         """Full-text search over episodic memory."""

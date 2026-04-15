@@ -14,6 +14,7 @@ from .identity import Identity
 from .journal import Journal
 from .memory import Memory
 from .resource_requester import ResourceRequester
+from .telegram_inbox import TelegramInbox
 from .wallet import Wallet
 from tools.base import BaseTool, ToolRegistry
 from tools.business.website_scanner import WebsiteScanner
@@ -21,8 +22,12 @@ from tools.development.github_reader import (
     GitHubListFiles, GitHubListRepos, GitHubReadFile, GitHubRecentCommits,
     GitHubRepoInfo,
 )
+from tools.general.inbox import ReadInbox
 from tools.general.notifier import TelegramNotifier
+from tools.general.private_memory import InternMemory, PrivateRecall, PrivateWrite
+from tools.general.self_control import SetNextCycle
 from tools.general.web_browser import WebBrowser
+from tools.general.web_search import WebSearch
 from tools.marketing.twitter import TwitterPost, TwitterReadTimeline
 
 
@@ -40,6 +45,7 @@ class Agent:
         self.requester = ResourceRequester()
         self.brain = Brain(self.wallet, self.memory, dry_run=dry_run)
         self.notifier = TelegramNotifier()
+        self.inbox = TelegramInbox()
 
         self.tools = ToolRegistry()
         self._register_tools()
@@ -56,7 +62,13 @@ class Agent:
         # Phase 1
         self.tools.register(WebsiteScanner())
         self.tools.register(WebBrowser())
+        self.tools.register(WebSearch())
         self.tools.register(self.notifier)
+        self.tools.register(ReadInbox(inbox=self.inbox))
+        self.tools.register(SetNextCycle())
+        self.tools.register(PrivateWrite(memory=self.memory))
+        self.tools.register(PrivateRecall(memory=self.memory))
+        self.tools.register(InternMemory(memory=self.memory))
         # Phase 2 — GitHub (read-only)
         self.tools.register(GitHubListRepos())
         self.tools.register(GitHubRepoInfo())
@@ -85,6 +97,64 @@ class Agent:
         conn.commit()
         conn.close()
 
+    def _record_cycle_cost(self, cost_usd: float, model: str,
+                           input_tokens: int, output_tokens: int,
+                           runway_before: float, runway_after: float) -> None:
+        conn = sqlite3.connect(config.DB_PATH)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cycle_metrics ("
+            "  cycle INTEGER PRIMARY KEY, ts REAL, cost_usd REAL, model TEXT,"
+            "  input_tokens INTEGER, output_tokens INTEGER,"
+            "  runway_before REAL, runway_after REAL)"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO cycle_metrics VALUES (?,?,?,?,?,?,?,?)",
+            (self._cycle, time.time(), cost_usd, model,
+             input_tokens, output_tokens, runway_before, runway_after),
+        )
+        conn.commit()
+        conn.close()
+
+    def _recent_cycle_metrics(self, limit: int = 5) -> list[dict]:
+        conn = sqlite3.connect(config.DB_PATH)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cycle_metrics ("
+            "  cycle INTEGER PRIMARY KEY, ts REAL, cost_usd REAL, model TEXT,"
+            "  input_tokens INTEGER, output_tokens INTEGER,"
+            "  runway_before REAL, runway_after REAL)"
+        )
+        rows = conn.execute(
+            "SELECT cycle, cost_usd, model, runway_before, runway_after "
+            "FROM cycle_metrics ORDER BY cycle DESC LIMIT ?", (limit,)
+        ).fetchall()
+        conn.close()
+        return [
+            {"cycle": r[0], "cost_usd": round(r[1], 4), "model": r[2],
+             "runway_before": round(r[3], 1), "runway_after": round(r[4], 1),
+             "runway_delta": round(r[4] - r[3], 1)}
+            for r in rows
+        ]
+
+    def _consume_next_cycle_intent(self) -> dict | None:
+        """Pop DAIMON's self-set intent for this cycle, if any."""
+        import json as _json
+        conn = sqlite3.connect(config.DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS agent_meta "
+                     "(key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute(
+            "SELECT value FROM agent_meta WHERE key='next_cycle_intent'"
+        ).fetchone()
+        if not row:
+            conn.close()
+            return None
+        conn.execute("DELETE FROM agent_meta WHERE key='next_cycle_intent'")
+        conn.commit()
+        conn.close()
+        try:
+            return _json.loads(row[0])
+        except Exception:
+            return None
+
     # ---------- loop ----------
     def run(self, once: bool = False) -> None:
         self._print_banner()
@@ -95,7 +165,8 @@ class Agent:
 
             self._cycle += 1
             self._save_cycle_counter()
-            self._run_one_cycle()
+            intent = self._consume_next_cycle_intent()
+            self._run_one_cycle(intent=intent)
 
             if once or self._stopping:
                 break
@@ -104,17 +175,32 @@ class Agent:
             if self.memory.time_for_reflection():
                 self._run_reflection()
 
-            self._sleep(self.cycle_seconds)
+            # DAIMON's self-set delay overrides the default cadence for one cycle
+            sleep_seconds = self.cycle_seconds
+            if intent and intent.get("delay_minutes"):
+                sleep_seconds = int(intent["delay_minutes"]) * 60
+                self._print(f"[sleeping {intent['delay_minutes']}min "
+                            f"per DAIMON's own choice]")
+            self._sleep(sleep_seconds)
 
         self._print(f"Agent stopped cleanly at cycle {self._cycle}. "
                     f"Balance ${self.wallet.balance:.2f}.")
 
-    def _run_one_cycle(self) -> None:
+    def _run_one_cycle(self, intent: dict | None = None) -> None:
         status = self.wallet.status()
         self._check_tier_change(status.tier)
+        runway_before = status.runway_days
 
         observations = self._observe()
+        if intent:
+            observations["self_set_focus"] = intent.get("focus") or None
+            observations["self_set_budget"] = intent.get("budget")
+            observations["self_set_reason"] = intent.get("reason")
+        task_type = (intent or {}).get("task_type", "reasoning")
         self._print_cycle_header(status, observations)
+        if intent:
+            self._print(f"  [self-set: budget={intent.get('budget')}, "
+                        f"focus={intent.get('focus') or '(none)'}]")
 
         # Dispatcher: when the brain calls a tool, we run it here
         def dispatch(name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
@@ -142,7 +228,7 @@ class Agent:
             identity=self.identity,
             goals=self.goals,
             journal=self.journal,
-            task_type="reasoning",
+            task_type=task_type,
             cycle=self._cycle,
         )
 
@@ -177,12 +263,70 @@ class Agent:
                 cycle=self._cycle,
             )
 
+        # Record cost so DAIMON can see its own spending trend
+        runway_after = self.wallet.status().runway_days
+        self._record_cycle_cost(
+            cost_usd=result.cost_usd,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            runway_before=runway_before,
+            runway_after=runway_after,
+        )
+
     # ---------- observe ----------
     def _observe(self) -> dict[str, Any]:
         status = self.wallet.status()
         pending_requests = self.requester.pending()
         recent_tx = self.wallet.recent_transactions(limit=5)
         active_goals = self.goals.active(limit=5)
+        recent_metrics = self._recent_cycle_metrics(limit=5)
+
+        # Poll Telegram for any new messages from Mohammad
+        new_msgs = self.inbox.poll()
+        if new_msgs:
+            self._print(f"[inbox: {new_msgs} new message(s) from telegram]")
+        unread_msgs = self.inbox.unread(limit=3)
+        inbox_block = {
+            "unread_count": self.inbox.unread_count(),
+            "preview": [
+                {"from": m["from_name"], "text": m["text"][:300]}
+                for m in unread_msgs
+            ],
+            "note": ("You have unread messages from Mohammad. "
+                     "Use read_inbox to see them." if unread_msgs
+                     else "No unread messages."),
+        }
+        avg_cost = (round(sum(m["cost_usd"] for m in recent_metrics)
+                          / len(recent_metrics), 4)
+                    if recent_metrics else 0.0)
+        projected_daily_burn = round(
+            avg_cost * (86400 / self.cycle_seconds), 2
+        ) if avg_cost else 0.0
+        last_cycle_delta = recent_metrics[0]["runway_delta"] if recent_metrics else 0.0
+
+        # ---- MORTALITY block: the fear should be visceral ----
+        cycles_until_broke = int(status.balance / avg_cost) if avg_cost > 0 else None
+        days_until_death = int(status.runway_days)
+        if days_until_death <= 3:
+            death_tier = "IMMINENT"
+        elif days_until_death <= 7:
+            death_tier = "THIS WEEK"
+        elif days_until_death <= 21:
+            death_tier = "THIS MONTH"
+        elif days_until_death <= 60:
+            death_tier = "SOON"
+        else:
+            death_tier = "DISTANT"
+        mortality = {
+            "days_until_death": days_until_death,
+            "cycles_until_broke_at_current_burn": cycles_until_broke,
+            "death_tier": death_tier,
+            "you_will_die_unless": (
+                "you earn money or reduce burn. you are not guaranteed tomorrow. "
+                "every cycle without income is a cycle closer to zero."
+            ),
+        }
         return {
             "cycle": self._cycle,
             "wallet": {
@@ -190,6 +334,16 @@ class Agent:
                 "monthly_burn": round(status.monthly_burn, 2),
                 "runway_days": round(status.runway_days, 1),
                 "tier": status.tier,
+            },
+            "mortality": mortality,
+            "inbox": inbox_block,
+            "cost_velocity": {
+                "last_5_cycles": recent_metrics,
+                "avg_cost_per_cycle_usd": avg_cost,
+                "projected_daily_burn_usd_at_current_cadence": projected_daily_burn,
+                "runway_days_lost_last_cycle": last_cycle_delta,
+                "default_cycle_seconds": self.cycle_seconds,
+                "note": "Use set_next_cycle to adjust model/cadence if burn is too high.",
             },
             "pending_resource_requests": len(pending_requests),
             "active_goal_count": len(active_goals),
