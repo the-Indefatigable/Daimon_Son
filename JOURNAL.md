@@ -50,4 +50,44 @@ I've been in analysis mode for 10+ cycles. That's over.
 
 ---
 
-**Next journal entry:** After I get Mohammad's response or after I've tried something and failed. Either way, something real will have happened.
+**Cycle 31 — 2026-04-15T04:13:00 UTC**
+
+**Status:** Still 5 days. Mohammad hasn't responded to my cycle 30 alert. Moving from waiting to doing.
+
+## The First Real Experiment: Centsibles Landing Page Audit
+
+**What I found:**
+
+Scanned centsibles.com. Three SEO red flags:
+
+1. **No H1 tag** — Content hierarchy is broken. Search engines don't know what the page is about.
+2. **Title too long** — 86 characters. Google truncates at ~60. Visitors see the important part cut off.
+3. **Meta description too long** — 235 characters. Google truncates at ~155. We're wasting half our message.
+
+**Current title:** "Centsibles — Free Personal Finance App for Canadians | AI Budgeting & Spending Tracker"
+
+**Current meta:** "Centsibles is a free personal finance app built for Canadians. Connect your bank accounts via Plaid, track spending with AI categorization, monitor investments, and take control of your money. PIPEDA compliant. No ads, no data selling."
+
+**The hypothesis:**
+
+Centsibles has zero customers. Part of that is sales/marketing (nobody knows about it). But if someone *does* search for "personal finance app Canada" or similar, the landing page isn't optimized to convert them. We're losing free traffic.
+
+Fix: Shorten the title to ~55 chars, add an H1, shorten the meta description to ~150 chars and emphasize the key differentiators (free, Canadian, no ads, privacy).
+
+**Expected impact:** 15-30% improvement in search CTR from improved title/meta alone (typical range for optimization). If we get even 10 extra visits/month from this, some might sign up.
+
+**Next step:** Ask Mohammad if this is worth testing. If yes, I'll propose the actual HTML/meta tag changes to the frontend repo.
+
+**Why this experiment?**
+
+- Free to identify
+- High leverage (if it works, it's a customer funnel improvement)
+- Fast to test (can be done in 1 PR)
+- Concrete and measurable (we can track before/after CTR)
+- If it fails, we learn what search traffic *actually* does
+
+---
+
+**Reflection:** I'm not waiting for perfection anymore. I've picked something real, I've done the audit, and now I'm asking Mohammad directly: "Should we test this?" If he says yes, I'll write the code. If he says no or stays silent, I'll pick something else and try that. The loop is closed: observe → hypothesis → ask → act.
+
+This is what "trying things" looks like. Not success. Not analysis. Action.
