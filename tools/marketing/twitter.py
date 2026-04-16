@@ -1,10 +1,13 @@
-"""Twitter/X tool. DAIMON's public voice — the heart of the Truth-Terminal channel.
+"""Twitter/X tool. DAIMON's public voice on @daimonuss.
 
 If Twitter API keys aren't set, the tool returns a clear 'I don't have access'
-result that tells DAIMON to file a resource request."""
+result that tells DAIMON to file a resource request. If the keys ARE set but
+the request fails, the error is classified by HTTP status so DAIMON can react
+correctly (out of credits → notify Mohammad; not a generic retry-soon)."""
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from permissions.levels import PermissionLevel
@@ -35,6 +38,63 @@ def _get_client():
         return client, None
     except Exception as e:
         return None, f"tweepy client init failed: {e}"
+
+
+def _classify_twitter_error(exc: Exception) -> dict[str, Any]:
+    """Turn a tweepy exception into a structured, actionable result.
+
+    Pay-per-use 402 is the high-stakes case: silent failure here would let
+    DAIMON keep trying and racking up nothing while thinking it succeeded."""
+    msg = str(exc)
+    status = None
+    m = re.search(r"\b(40\d|429|5\d\d)\b", msg)
+    if m:
+        status = int(m.group(1))
+
+    if status == 402 or "Payment Required" in msg or "credits" in msg.lower():
+        return {
+            "ok": False,
+            "summary": (
+                "X account has zero credits — pay-per-use exhausted. "
+                "Notify Mohammad via notify_mohammad to top up at "
+                "developer.x.com → Billing. Stop trying twitter_post until then."
+            ),
+            "needs_resource": "TWITTER_CREDITS",
+            "http_status": 402,
+        }
+    if status == 401:
+        return {
+            "ok": False,
+            "summary": (
+                "X auth failed (401). Tokens may be revoked or App permissions "
+                "changed. Notify Mohammad — he needs to re-run "
+                "scripts/twitter_oauth_dance.py."
+            ),
+            "http_status": 401,
+        }
+    if status == 403:
+        # 403 from create_tweet is usually duplicate content or a write
+        # forbidden by App permissions (Read-only).
+        return {
+            "ok": False,
+            "summary": (
+                "X 403 — likely duplicate tweet or App permissions are Read-only. "
+                "If duplicate, vary the text. If permissions, Mohammad needs to "
+                "set Read+Write in the X dev portal and regenerate tokens."
+            ),
+            "http_status": 403,
+        }
+    if status == 429:
+        return {
+            "ok": False,
+            "summary": "X rate limit (429). Wait before retrying.",
+            "http_status": 429,
+        }
+    return {
+        "ok": False,
+        "summary": f"twitter error ({type(exc).__name__}): {msg[:300]}",
+        "http_status": status,
+    }
 
 
 NEEDS_ACCESS = {
@@ -100,9 +160,10 @@ class TwitterPost(BaseTool):
                 "summary": f"posted tweet {tweet_id}",
                 "tweet_id": tweet_id,
                 "text": text,
+                "url": f"https://x.com/daimonuss/status/{tweet_id}" if tweet_id else None,
             }
         except Exception as e:
-            return {"ok": False, "summary": f"twitter error: {e}"}
+            return _classify_twitter_error(e)
 
 
 class TwitterReadTimeline(BaseTool):
@@ -132,11 +193,13 @@ class TwitterReadTimeline(BaseTool):
         client, err = _get_client()
         if err:
             return {"ok": False, "summary": err}
-        kind = kwargs.get("kind", "mentions")
+        kind = kwargs.get("kind", "home")
         limit = int(kwargs.get("limit", 10))
         try:
-            me = client.get_me()
             if kind == "mentions":
+                # mentions requires Basic+ tier on pay-per-use ($200/mo).
+                # Free/PPU returns 401 here even with valid OAuth.
+                me = client.get_me()
                 resp = client.get_users_mentions(
                     id=me.data.id, max_results=min(100, max(5, limit)),
                 )
@@ -148,4 +211,16 @@ class TwitterReadTimeline(BaseTool):
             return {"ok": True, "summary": f"{len(tweets)} {kind} tweets",
                     "tweets": tweets}
         except Exception as e:
-            return {"ok": False, "summary": f"twitter error: {e}"}
+            cls = _classify_twitter_error(e)
+            if kind == "mentions" and cls.get("http_status") == 401:
+                return {
+                    "ok": False,
+                    "summary": (
+                        "X mentions endpoint requires Basic tier ($200/mo) — "
+                        "blocked on pay-per-use. Use kind='home' instead, or "
+                        "notify_mohammad to upgrade."
+                    ),
+                    "needs_resource": "TWITTER_BASIC_TIER",
+                    "http_status": 401,
+                }
+            return cls

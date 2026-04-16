@@ -35,6 +35,10 @@ from tools.development.self_pr import GitHubProposePR
 from tools.development.write_repo_fact import ReadRepoFacts, WriteRepoFact
 from tools.general.bluesky import BlueskyPost
 from tools.general.bluesky_read import BlueskyRead
+from tools.general.bluesky_actions import (
+    BlueskyDeletePost, BlueskyEditProfile, BlueskyFollow, BlueskyGetProfile,
+    BlueskyLike, BlueskyQuote, BlueskyRepost, BlueskyUnfollow, BlueskyUnlike,
+)
 from tools.general.bluesky_engage import BlueskyReply, BlueskySearch
 from tools.general.expect_result import ExpectResult
 from tools.general.inbox import ReadInbox
@@ -139,6 +143,17 @@ class Agent:
         self.tools.register(BlueskyPost())
         self.tools.register(BlueskyReply())
         self.tools.register(BlueskySearch())
+        # Phase 4.8 — Bluesky engagement layer (like, repost, quote, follow,
+        # unfollow, get_profile, edit_profile, delete_post)
+        self.tools.register(BlueskyLike())
+        self.tools.register(BlueskyUnlike())
+        self.tools.register(BlueskyRepost())
+        self.tools.register(BlueskyQuote())
+        self.tools.register(BlueskyFollow())
+        self.tools.register(BlueskyUnfollow())
+        self.tools.register(BlueskyGetProfile())
+        self.tools.register(BlueskyEditProfile())
+        self.tools.register(BlueskyDeletePost())
 
     def _load_cycle_counter(self) -> int:
         conn = sqlite3.connect(config.DB_PATH)

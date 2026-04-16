@@ -14,7 +14,8 @@ from permissions.levels import PermissionLevel
 from tools.base import BaseTool
 
 
-BSKY_HOST = "https://bsky.social"
+BSKY_HOST = "https://bsky.social"           # PDS — auth-required write
+READ_HOST = "https://api.bsky.app"          # AppView — read endpoints
 MAX_POST_CHARS = 300
 
 
@@ -34,10 +35,10 @@ def _session() -> tuple[str, str] | None:
 
 
 def _resolve_post(jwt: str, at_uri: str) -> dict[str, Any] | None:
-    """Resolve an at:// post URI → full record incl. root for threading."""
+    """Resolve an at:// post URI → full record incl. root for threading.
+    Read-only — uses public AppView, no auth needed."""
     r = httpx.get(
-        f"{BSKY_HOST}/xrpc/app.bsky.feed.getPosts",
-        headers={"Authorization": f"Bearer {jwt}"},
+        f"{READ_HOST}/xrpc/app.bsky.feed.getPosts",
         params={"uris": at_uri},
         timeout=15.0,
     )
@@ -157,13 +158,10 @@ class BlueskySearch(BaseTool):
         if not query:
             return {"ok": False, "summary": "empty query"}
         try:
-            sess = _session()
-            if sess is None:
-                return {"ok": False, "summary": "no BLUESKY creds"}
-            jwt, _ = sess
+            # Search — public AppView, no auth (avoids the scoped-app-password
+            # 403 from bsky.social/searchPosts).
             r = httpx.get(
-                f"{BSKY_HOST}/xrpc/app.bsky.feed.searchPosts",
-                headers={"Authorization": f"Bearer {jwt}"},
+                f"{READ_HOST}/xrpc/app.bsky.feed.searchPosts",
                 params={"q": query, "limit": limit, "sort": sort},
                 timeout=15.0,
             )

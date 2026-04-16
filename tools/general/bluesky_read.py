@@ -12,7 +12,8 @@ from permissions.levels import PermissionLevel
 from tools.base import BaseTool
 
 
-BSKY_HOST = "https://bsky.social"
+BSKY_HOST = "https://bsky.social"           # PDS — auth-required endpoints
+READ_HOST = "https://api.bsky.app"          # AppView — no-auth read endpoints
 
 
 def _session() -> tuple[str, str] | dict[str, Any]:
@@ -57,38 +58,51 @@ class BlueskyRead(BaseTool):
         handle = os.getenv("BLUESKY_HANDLE", "").strip()
         limit = int(kwargs.get("limit", 20))
         try:
-            sess = _session()
-            if isinstance(sess, dict):
-                return sess
-            jwt, did = sess
-            auth = {"Authorization": f"Bearer {jwt}"}
-
+            # Profile — public AppView, no auth (avoids the scoped-app-password
+            # 403 that bsky.social/getProfile returns for some accounts).
             prof = httpx.get(
-                f"{BSKY_HOST}/xrpc/app.bsky.actor.getProfile",
-                headers=auth, params={"actor": did}, timeout=15.0,
+                f"{READ_HOST}/xrpc/app.bsky.actor.getProfile",
+                params={"actor": handle}, timeout=15.0,
             )
             prof.raise_for_status()
             p = prof.json()
 
-            notif = httpx.get(
-                f"{BSKY_HOST}/xrpc/app.bsky.notification.listNotifications",
-                headers=auth, params={"limit": limit}, timeout=15.0,
-            )
-            notif.raise_for_status()
-            n = notif.json()
-
+            # Notifications — needs auth, must hit PDS. Some scoped app
+            # passwords 403 here; degrade gracefully so profile data still
+            # comes back.
             items: list[dict[str, Any]] = []
-            for entry in n.get("notifications", []):
-                author = entry.get("author") or {}
-                rec = entry.get("record") or {}
-                items.append({
-                    "kind": entry.get("reason"),  # like, reply, follow, repost, mention, quote
-                    "from_handle": author.get("handle"),
-                    "from_display": author.get("displayName"),
-                    "text": rec.get("text", "")[:280] if isinstance(rec, dict) else "",
-                    "indexed_at": entry.get("indexedAt"),
-                    "is_read": entry.get("isRead", False),
-                })
+            notif_status = "ok"
+            sess = _session()
+            if isinstance(sess, dict):
+                notif_status = sess["summary"]
+            else:
+                jwt, _did = sess
+                try:
+                    notif = httpx.get(
+                        f"{BSKY_HOST}/xrpc/app.bsky.notification."
+                        "listNotifications",
+                        headers={"Authorization": f"Bearer {jwt}"},
+                        params={"limit": limit}, timeout=15.0,
+                    )
+                    notif.raise_for_status()
+                    for entry in notif.json().get("notifications", []):
+                        author = entry.get("author") or {}
+                        rec = entry.get("record") or {}
+                        items.append({
+                            "kind": entry.get("reason"),  # like / reply / follow / repost / mention / quote
+                            "from_handle": author.get("handle"),
+                            "from_display": author.get("displayName"),
+                            "text": rec.get("text", "")[:280]
+                                    if isinstance(rec, dict) else "",
+                            "indexed_at": entry.get("indexedAt"),
+                            "is_read": entry.get("isRead", False),
+                        })
+                except httpx.HTTPStatusError as e:
+                    notif_status = (
+                        f"notifications unavailable (http {e.response.status_code}) "
+                        "— app password may need 'access' scope; regenerate at "
+                        "bsky.app/settings/app-passwords"
+                    )
 
             return {
                 "ok": True,
@@ -96,7 +110,9 @@ class BlueskyRead(BaseTool):
                     f"@{handle}: {p.get('followersCount', 0)} followers, "
                     f"{p.get('followsCount', 0)} following, "
                     f"{p.get('postsCount', 0)} posts. "
-                    f"{len(items)} recent notification(s)."
+                    + (f"{len(items)} recent notification(s)."
+                       if notif_status == "ok"
+                       else f"[{notif_status}]")
                 ),
                 "profile": {
                     "handle": handle,
@@ -107,6 +123,7 @@ class BlueskyRead(BaseTool):
                     "posts": p.get("postsCount", 0),
                 },
                 "notifications": items,
+                "notifications_status": notif_status,
             }
         except httpx.HTTPStatusError as e:
             return {
