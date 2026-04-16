@@ -188,8 +188,11 @@ class GitHubListFiles(BaseTool):
 class GitHubReadFile(BaseTool):
     name = "github_read_file"
     description = (
-        "Read the contents of a specific file in a repo at a specific ref. "
-        "Use for inspecting code, configs, READMEs. Returns decoded text."
+        "Read a specific file in a repo. For large files, read in chunks using "
+        "`offset` + `max_chars`: first call with offset=0 returns the first "
+        "chunk AND the total file size so you know how many more chunks to fetch. "
+        "Each chunk maxes at ~15KB regardless of max_chars due to tool-result "
+        "limits — don't re-read the same chunk; advance `offset`."
     )
     permission_level = PermissionLevel.AUTO
 
@@ -200,7 +203,11 @@ class GitHubReadFile(BaseTool):
                 "repo": {"type": "string", "description": "owner/name"},
                 "path": {"type": "string", "description": "File path from repo root"},
                 "ref": {"type": "string"},
-                "max_chars": {"type": "integer", "default": 10000},
+                "max_chars": {"type": "integer", "default": 15000,
+                              "description": "Max chars returned (hard cap ~15KB)."},
+                "offset": {"type": "integer", "default": 0,
+                           "description": "Char offset into the file. Use to "
+                                          "page through large files."},
             },
             "required": ["repo", "path"],
         }
@@ -212,7 +219,8 @@ class GitHubReadFile(BaseTool):
         repo = kwargs["repo"]
         path = kwargs["path"]
         ref = kwargs.get("ref")
-        max_chars = int(kwargs.get("max_chars", 10000))
+        max_chars = min(int(kwargs.get("max_chars", 15000)), 15000)
+        offset = max(int(kwargs.get("offset", 0)), 0)
         url = f"{GITHUB_API}/repos/{repo}/contents/{path}"
         params = {"ref": ref} if ref else {}
         try:
@@ -228,15 +236,25 @@ class GitHubReadFile(BaseTool):
             raw = base64.b64decode(content_b64).decode("utf-8", errors="replace")
         except Exception as e:
             return {"ok": False, "summary": f"decode failed: {e}"}
-        truncated = len(raw) > max_chars
-        raw = raw[:max_chars]
+        total_chars = len(raw)
+        chunk = raw[offset:offset + max_chars]
+        end = offset + len(chunk)
+        has_more = end < total_chars
         return {
             "ok": True,
-            "summary": f"{repo}/{path} @ {ref or 'default'} — {len(raw)} chars"
-                       + (" (truncated)" if truncated else ""),
+            "summary": (
+                f"{repo}/{path} @ {ref or 'default'} — "
+                f"chars {offset}-{end} of {total_chars}"
+                + (f" — {total_chars - end} more to read (call with offset={end})"
+                   if has_more else " (complete)")
+            ),
             "path": path,
-            "content": raw,
-            "truncated": truncated,
+            "content": chunk,
+            "offset": offset,
+            "returned_chars": len(chunk),
+            "total_chars": total_chars,
+            "has_more": has_more,
+            "next_offset": end if has_more else None,
             "sha": data.get("sha"),
         }
 

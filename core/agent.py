@@ -17,12 +17,21 @@ from .resource_requester import ResourceRequester
 from .telegram_inbox import TelegramInbox
 from .wallet import Wallet
 from tools.base import BaseTool, ToolRegistry
+from tools.business.ga4_metrics import GA4Metrics
+from tools.business.gsc_metrics import GSCMetrics
+from tools.business.stripe_catalog import StripeCatalog
+from tools.business.stripe_metrics import StripeMetrics
 from tools.business.website_scanner import WebsiteScanner
+from tools.development.github_pr_status import GitHubPRStatus
 from tools.development.github_reader import (
     GitHubListFiles, GitHubListRepos, GitHubReadFile, GitHubRecentCommits,
     GitHubRepoInfo,
 )
+from tools.development.business_pr import GitHubBusinessPR
 from tools.development.self_pr import GitHubProposePR
+from tools.general.bluesky import BlueskyPost
+from tools.general.bluesky_read import BlueskyRead
+from tools.general.bluesky_engage import BlueskyReply, BlueskySearch
 from tools.general.inbox import ReadInbox
 from tools.general.notifier import TelegramNotifier
 from tools.general.private_memory import InternMemory, PrivateRecall, PrivateWrite
@@ -78,9 +87,22 @@ class Agent:
         self.tools.register(GitHubRecentCommits())
         # Phase 3 — self-PR (scoped only to Daimon_Son)
         self.tools.register(GitHubProposePR())
+        # Phase 3 — business PR (scoped to Centsibles repos via allowlist)
+        self.tools.register(GitHubBusinessPR())
+        # Phase 4 — feedback loops
+        self.tools.register(GitHubPRStatus())
+        self.tools.register(BlueskyRead())
+        self.tools.register(StripeMetrics())
+        self.tools.register(StripeCatalog())
+        self.tools.register(GA4Metrics())
+        self.tools.register(GSCMetrics())
         # Phase 2 — Twitter (stub-safe if keys missing)
         self.tools.register(TwitterPost())
         self.tools.register(TwitterReadTimeline())
+        # Phase 3 — Bluesky (free, public voice)
+        self.tools.register(BlueskyPost())
+        self.tools.register(BlueskyReply())
+        self.tools.register(BlueskySearch())
 
     def _load_cycle_counter(self) -> int:
         conn = sqlite3.connect(config.DB_PATH)
@@ -139,7 +161,8 @@ class Agent:
         ]
 
     def _consume_next_cycle_intent(self) -> dict | None:
-        """Pop DAIMON's self-set intent for this cycle, if any."""
+        """Read DAIMON's self-set intent. Budget persists across cycles until
+        explicitly changed; focus/reason/delay are one-shot (cleared after read)."""
         import json as _json
         conn = sqlite3.connect(config.DB_PATH)
         conn.execute("CREATE TABLE IF NOT EXISTS agent_meta "
@@ -150,13 +173,28 @@ class Agent:
         if not row:
             conn.close()
             return None
-        conn.execute("DELETE FROM agent_meta WHERE key='next_cycle_intent'")
+        try:
+            intent = _json.loads(row[0])
+        except Exception:
+            conn.execute("DELETE FROM agent_meta WHERE key='next_cycle_intent'")
+            conn.commit()
+            conn.close()
+            return None
+        # Strip the one-shot fields but keep budget/task_type sticky.
+        sticky = {
+            "budget": intent.get("budget"),
+            "task_type": intent.get("task_type"),
+            "set_at": intent.get("set_at"),
+            "sticky": True,
+        }
+        conn.execute(
+            "INSERT INTO agent_meta (key, value) VALUES ('next_cycle_intent', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_json.dumps(sticky),),
+        )
         conn.commit()
         conn.close()
-        try:
-            return _json.loads(row[0])
-        except Exception:
-            return None
+        return intent
 
     # ---------- loop ----------
     def run(self, once: bool = False) -> None:
