@@ -9,6 +9,7 @@ from typing import Any
 
 from . import config
 from .brain import Brain, BrainResult
+from .expectations import Expectations
 from .goals import Goals
 from .identity import Identity
 from .journal import Journal
@@ -32,9 +33,11 @@ from tools.development.self_pr import GitHubProposePR
 from tools.general.bluesky import BlueskyPost
 from tools.general.bluesky_read import BlueskyRead
 from tools.general.bluesky_engage import BlueskyReply, BlueskySearch
+from tools.general.expect_result import ExpectResult
 from tools.general.inbox import ReadInbox
 from tools.general.notifier import TelegramNotifier
 from tools.general.private_memory import InternMemory, PrivateRecall, PrivateWrite
+from tools.general.record_outcome import RecordOutcome
 from tools.general.self_control import SetNextCycle
 from tools.general.web_browser import WebBrowser
 from tools.general.web_search import WebSearch
@@ -49,6 +52,7 @@ class Agent:
 
         self.wallet = Wallet()
         self.memory = Memory()
+        self.expectations = Expectations()
         self.identity = Identity()
         self.goals = Goals()
         self.journal = Journal()
@@ -79,6 +83,15 @@ class Agent:
         self.tools.register(PrivateWrite(memory=self.memory))
         self.tools.register(PrivateRecall(memory=self.memory))
         self.tools.register(InternMemory(memory=self.memory))
+        # Prediction-error encoding (time-awareness + memory salience)
+        self.tools.register(ExpectResult(
+            expectations=self.expectations,
+            get_cycle=lambda: self._cycle,
+        ))
+        self.tools.register(RecordOutcome(
+            expectations=self.expectations,
+            memory=self.memory,
+        ))
         # Phase 2 — GitHub (read-only)
         self.tools.register(GitHubListRepos())
         self.tools.register(GitHubRepoInfo())
@@ -368,8 +381,43 @@ class Agent:
                 "every cycle without income is a cycle closer to zero."
             ),
         }
+        # ---- TIME block: when am I, in human terms ----
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now().astimezone()
+        hour = now_local.hour
+        if hour < 6:
+            phase = "late_night"
+        elif hour < 12:
+            phase = "morning"
+        elif hour < 17:
+            phase = "afternoon"
+        elif hour < 22:
+            phase = "evening"
+        else:
+            phase = "late_night"
+        time_block = {
+            "utc": now_utc.isoformat(timespec="minutes"),
+            "local": now_local.isoformat(timespec="minutes"),
+            "day_of_week": now_local.strftime("%A"),
+            "phase": phase,
+            "cycle_cadence_minutes": self.cycle_seconds // 60,
+            "note": (
+                f"It's {phase} ({now_local.strftime('%H:%M %Z')}, "
+                f"{now_local.strftime('%A')}). Humans on this side of the planet "
+                "are likely "
+                + {"late_night": "asleep — Bluesky/social engagement will be near zero",
+                   "morning": "waking up — engagement is climbing",
+                   "afternoon": "active — peak engagement window",
+                   "evening": "winding down — second engagement peak"}[phase]
+                + "."
+            ),
+        }
+
+        expectations_block = self.expectations.snapshot_for_observations()
+
         return {
             "cycle": self._cycle,
+            "time": time_block,
             "wallet": {
                 "balance": round(status.balance, 2),
                 "monthly_burn": round(status.monthly_burn, 2),
@@ -377,6 +425,7 @@ class Agent:
                 "tier": status.tier,
             },
             "mortality": mortality,
+            "expectations": expectations_block,
             "inbox": inbox_block,
             "cost_velocity": {
                 "last_5_cycles": recent_metrics,
@@ -406,7 +455,6 @@ class Agent:
                 ["TWITTER_API_KEY", "TWITTER_API_SECRET",
                  "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_SECRET"]
             ) else "none — file resource request if you want it",
-            "utc_now": datetime.now(timezone.utc).isoformat(timespec="minutes"),
         }
 
     # ---------- tier change detection ----------
