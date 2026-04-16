@@ -122,6 +122,7 @@ class TwitterPost(BaseTool):
         "passing `in_reply_to` with the previous tweet id."
     )
     permission_level = PermissionLevel.AUTO  # your account, your voice
+    cost_per_use = 0.016  # X PPU empirical: $0.08 / 5 posts (cycle 70)
 
     def input_schema(self) -> dict[str, Any]:
         return {
