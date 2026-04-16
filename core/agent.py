@@ -9,6 +9,7 @@ from typing import Any
 
 from . import config
 from .brain import Brain, BrainResult
+from .embeddings import EmbeddingService
 from .expectations import Expectations
 from .repo_schema import RepoSchema
 from .goals import Goals
@@ -53,9 +54,10 @@ class Agent:
             else config.CYCLE_INTERVAL_MINUTES * 60
 
         self.wallet = Wallet()
-        self.memory = Memory()
+        self.embeddings = EmbeddingService()
+        self.memory = Memory(embedding_service=self.embeddings)
         self.expectations = Expectations()
-        self.repo_schema = RepoSchema()
+        self.repo_schema = RepoSchema(embedding_service=self.embeddings)
         self.identity = Identity()
         self.goals = Goals()
         self.journal = Journal()
@@ -63,6 +65,18 @@ class Agent:
         self.brain = Brain(self.wallet, self.memory, dry_run=dry_run)
         self.notifier = TelegramNotifier()
         self.inbox = TelegramInbox()
+
+        # Backfill embeddings for any rows written before the embedding layer
+        # existed. Idempotent — runs every startup, only embeds missing rows.
+        if self.embeddings.enabled:
+            backfilled_mem = self.memory.backfill_embeddings()
+            backfilled_repo = self.repo_schema.backfill_embeddings()
+            total = sum(backfilled_mem.values()) + backfilled_repo
+            if total:
+                print(f"[embeddings] backfilled {total} rows "
+                      f"(episodic={backfilled_mem['episodic']}, "
+                      f"strategic={backfilled_mem['strategic']}, "
+                      f"repo_facts={backfilled_repo})")
 
         self.tools = ToolRegistry()
         self._register_tools()
@@ -285,6 +299,7 @@ class Agent:
             self._print(f"    ← {str(result.get('summary', ''))[:200]}")
             return result
 
+        query_text = self._build_query_text(focus_text=focus_text, intent=intent)
         result: BrainResult = self.brain.think(
             observations=observations,
             tools=self.tools.all(),
@@ -294,6 +309,7 @@ class Agent:
             journal=self.journal,
             task_type=task_type,
             cycle=self._cycle,
+            query_text=query_text,
         )
 
         self._print(f"\n[DAIMON]: {result.final_text.strip()[:1200]}")
@@ -337,6 +353,44 @@ class Agent:
             runway_before=runway_before,
             runway_after=runway_after,
         )
+
+    # ---------- query text (for semantic recall) ----------
+    def _build_query_text(self, focus_text: str = "",
+                          intent: dict | None = None) -> str:
+        """Concatenate the things DAIMON is most likely thinking about right now,
+        so embedding recall surfaces memories relevant to *this* cycle's intent
+        rather than anything keyword-matching the observation schema."""
+        parts: list[str] = []
+        if focus_text:
+            parts.append(focus_text)
+        if intent and intent.get("reason"):
+            parts.append(intent["reason"])
+        # Recent journal entry (DAIMON's own most recent thought)
+        try:
+            recent = self.journal.recent(limit=1)
+            if recent:
+                body = getattr(recent[0], "body", "") or ""
+                if body:
+                    parts.append(body[:600])
+        except Exception:
+            pass
+        # Active goals
+        try:
+            for g in self.goals.active(limit=3):
+                title = g.get("title") or g.get("description") or ""
+                if title:
+                    parts.append(title)
+        except Exception:
+            pass
+        # Inbox preview (Mohammad's recent messages)
+        try:
+            for m in self.inbox.unread(limit=2):
+                txt = (m.get("text") or "")[:300]
+                if txt:
+                    parts.append(txt)
+        except Exception:
+            pass
+        return "\n".join(p for p in parts if p).strip()
 
     # ---------- observe ----------
     def _observe(self, focus_text: str = "") -> dict[str, Any]:

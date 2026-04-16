@@ -13,10 +13,11 @@ from . import config
 
 
 class Memory:
-    def __init__(self, db_path: Path = config.DB_PATH):
+    def __init__(self, db_path: Path = config.DB_PATH, embedding_service=None):
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        self._embeddings = embedding_service  # None = no semantic recall
         self._init_schema()
         self._migrate()
         self._ensure_identity()
@@ -128,7 +129,19 @@ class Memory:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), cycle, action, details, outcome, evaluation, lesson, tag_str),
         )
-        return cur.lastrowid
+        ep_id = cur.lastrowid
+        if self._embeddings:
+            text = self._episodic_text(action, details, outcome, lesson)
+            self._embeddings.embed_and_store("episodic", ep_id, text)
+        return ep_id
+
+    @staticmethod
+    def _episodic_text(action: str, details: str, outcome: str, lesson: str) -> str:
+        parts = [action]
+        if details: parts.append(details)
+        if outcome: parts.append(outcome)
+        if lesson: parts.append(f"lesson: {lesson}")
+        return " | ".join(parts)
 
     def update_episodic_outcome(self, episode_id: int, outcome: str,
                                  evaluation: str = "unknown", lesson: str = "") -> None:
@@ -243,7 +256,12 @@ class Memory:
             "created_at, last_updated) VALUES (?, ?, ?, 1, ?, ?)",
             (category, insight, confidence, now, now),
         )
-        return cur.lastrowid
+        sid = cur.lastrowid
+        if self._embeddings:
+            self._embeddings.embed_and_store(
+                "strategic", sid, f"[{category}] {insight}"
+            )
+        return sid
 
     def reinforce_strategic(self, insight_id: int, confidence_delta: float = 0.1) -> None:
         row = self._conn.execute(
@@ -286,10 +304,16 @@ class Memory:
 
     # ---------- recall ----------
     def recall_for_context(self, observations: dict, limit_episodes: int = 5,
-                           limit_strategic: int = 5) -> dict[str, Any]:
-        """Assemble the memory slice to inject into this cycle's prompt."""
+                           limit_strategic: int = 5,
+                           query_text: str | None = None,
+                           k_semantic: int = 6) -> dict[str, Any]:
+        """Assemble the memory slice to inject into this cycle's prompt.
+
+        If query_text + an embedding service are available, augment with
+        semantically-relevant rows from across episodic / strategic / repo_facts.
+        Falls back cleanly to the keyword path when either is missing.
+        """
         recent = self.recent_episodes(limit=limit_episodes)
-        # Use observation keys as loose keywords to surface relevant strategic memory
         keywords = [str(k) for k in observations.keys()][:5]
         strategic: list[dict] = []
         seen: set[int] = set()
@@ -305,12 +329,108 @@ class Memory:
                     seen.add(row["id"])
                     if len(strategic) >= limit_strategic:
                         break
+
+        semantic_hits: list[dict] = []
+        if query_text and self._embeddings and self._embeddings.enabled:
+            raw_hits = self._embeddings.search(
+                query=query_text,
+                k=k_semantic,
+                source_tables=["episodic", "strategic", "repo_facts"],
+                min_similarity=0.35,
+            )
+            semantic_hits = self._hydrate_hits(raw_hits)
+
         return {
             "identity": self.identity(),
             "recent_episodes": recent,
             "strategic_insights": strategic[:limit_strategic],
+            "semantic_hits": semantic_hits,
             "last_reflection": self.last_reflection(),
         }
+
+    def _hydrate_hits(self, hits: list[dict]) -> list[dict]:
+        """Pull the actual content for each (source_table, source_id) hit so the
+        prompt sees more than the truncated `text` snapshot."""
+        out: list[dict] = []
+        for h in hits:
+            table, sid, sim = h["source_table"], h["source_id"], h["similarity"]
+            row = None
+            if table == "episodic":
+                r = self._conn.execute(
+                    "SELECT id, ts, action, details, outcome, lesson, evaluation, tier "
+                    "FROM episodic WHERE id=?", (sid,)
+                ).fetchone()
+                if r:
+                    row = {
+                        "kind": "episode", "id": r["id"], "ts": r["ts"],
+                        "action": r["action"],
+                        "summary": (r["outcome"] or r["details"] or "")[:400],
+                        "lesson": r["lesson"] or None,
+                        "evaluation": r["evaluation"], "tier": r["tier"],
+                    }
+            elif table == "strategic":
+                r = self._conn.execute(
+                    "SELECT id, category, insight, confidence, evidence_count "
+                    "FROM strategic WHERE id=?", (sid,)
+                ).fetchone()
+                if r:
+                    row = {
+                        "kind": "strategic", "id": r["id"],
+                        "category": r["category"], "insight": r["insight"],
+                        "confidence": round(r["confidence"], 2),
+                        "evidence_count": r["evidence_count"],
+                    }
+            elif table == "repo_facts":
+                r = self._conn.execute(
+                    "SELECT id, repo, category, key, body, source, confidence "
+                    "FROM repo_facts WHERE id=?", (sid,)
+                ).fetchone()
+                if r:
+                    row = {
+                        "kind": "repo_fact", "id": r["id"],
+                        "repo": r["repo"], "category": r["category"],
+                        "key": r["key"], "body": r["body"][:500],
+                        "source": r["source"],
+                        "confidence": round(r["confidence"], 2),
+                    }
+            if row:
+                row["similarity"] = sim
+                out.append(row)
+        return out
+
+    # ---------- backfill ----------
+    def backfill_embeddings(self) -> dict[str, int]:
+        """Embed any episodic/strategic rows that don't yet have embeddings.
+        Idempotent — safe to call at every startup."""
+        if not self._embeddings or not self._embeddings.enabled:
+            return {"episodic": 0, "strategic": 0}
+        # episodic
+        ep_rows = self._conn.execute(
+            "SELECT e.id, e.action, e.details, e.outcome, e.lesson "
+            "FROM episodic e LEFT JOIN embeddings emb "
+            "ON emb.source_table='episodic' AND emb.source_id=e.id "
+            "WHERE emb.source_id IS NULL"
+        ).fetchall()
+        ep_triples = [
+            ("episodic", r["id"],
+             self._episodic_text(r["action"], r["details"] or "",
+                                 r["outcome"] or "", r["lesson"] or ""))
+            for r in ep_rows
+        ]
+        # strategic
+        st_rows = self._conn.execute(
+            "SELECT s.id, s.category, s.insight "
+            "FROM strategic s LEFT JOIN embeddings emb "
+            "ON emb.source_table='strategic' AND emb.source_id=s.id "
+            "WHERE emb.source_id IS NULL"
+        ).fetchall()
+        st_triples = [
+            ("strategic", r["id"], f"[{r['category']}] {r['insight']}")
+            for r in st_rows
+        ]
+        ep_n = self._embeddings.embed_and_store_batch(ep_triples)
+        st_n = self._embeddings.embed_and_store_batch(st_triples)
+        return {"episodic": ep_n, "strategic": st_n}
 
     # ---------- reflection ----------
     def last_reflection(self) -> dict | None:
@@ -352,6 +472,28 @@ class Memory:
             parts.append("IDENTITY:")
             for k, v in ident.items():
                 parts.append(f"  - {k}: {v}")
+        semantic = recall.get("semantic_hits") or []
+        if semantic:
+            parts.append("\nSEMANTICALLY-RELEVANT MEMORIES (matched to what you're "
+                         "thinking about right now — use these before searching again):")
+            for h in semantic:
+                sim = h.get("similarity", 0)
+                if h["kind"] == "episode":
+                    parts.append(
+                        f"  · [ep#{h['id']} sim={sim:.2f}] {h['action']}: "
+                        f"{h['summary']}"
+                        + (f" — LESSON: {h['lesson']}" if h.get('lesson') else "")
+                    )
+                elif h["kind"] == "strategic":
+                    parts.append(
+                        f"  · [strat#{h['id']} sim={sim:.2f} category={h['category']} "
+                        f"conf={h['confidence']}] {h['insight']}"
+                    )
+                elif h["kind"] == "repo_fact":
+                    parts.append(
+                        f"  · [repo#{h['id']} sim={sim:.2f} {h['repo']}/"
+                        f"{h['category']}/{h['key']}] {h['body']}"
+                    )
         strategic = recall.get("strategic_insights") or []
         if strategic:
             parts.append("\nSTRATEGIC INSIGHTS (things I've learned):")

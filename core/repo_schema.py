@@ -27,10 +27,11 @@ from . import config
 
 
 class RepoSchema:
-    def __init__(self, db_path: Path = config.DB_PATH):
+    def __init__(self, db_path: Path = config.DB_PATH, embedding_service=None):
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        self._embeddings = embedding_service
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -84,7 +85,12 @@ class RepoSchema:
                 "confidence=? WHERE id=?",
                 (body, source, cycle, now, confidence, existing["id"]),
             )
-            return {"ok": True, "action": "updated", "id": existing["id"],
+            fact_id = existing["id"]
+            if self._embeddings:
+                self._embeddings.embed_and_store(
+                    "repo_facts", fact_id, self._embed_text(repo, category, key, body)
+                )
+            return {"ok": True, "action": "updated", "id": fact_id,
                     "previous_body": existing["body"][:200]}
         cur = self._conn.execute(
             "INSERT INTO repo_facts "
@@ -92,7 +98,32 @@ class RepoSchema:
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (repo, category, key, body, source, cycle, now, now, confidence),
         )
-        return {"ok": True, "action": "created", "id": cur.lastrowid}
+        fact_id = cur.lastrowid
+        if self._embeddings:
+            self._embeddings.embed_and_store(
+                "repo_facts", fact_id, self._embed_text(repo, category, key, body)
+            )
+        return {"ok": True, "action": "created", "id": fact_id}
+
+    @staticmethod
+    def _embed_text(repo: str, category: str, key: str, body: str) -> str:
+        return f"{repo} [{category}/{key}] {body}"
+
+    def backfill_embeddings(self) -> int:
+        if not self._embeddings or not self._embeddings.enabled:
+            return 0
+        rows = self._conn.execute(
+            "SELECT rf.id, rf.repo, rf.category, rf.key, rf.body "
+            "FROM repo_facts rf LEFT JOIN embeddings emb "
+            "ON emb.source_table='repo_facts' AND emb.source_id=rf.id "
+            "WHERE emb.source_id IS NULL"
+        ).fetchall()
+        triples = [
+            ("repo_facts", r["id"],
+             self._embed_text(r["repo"], r["category"], r["key"], r["body"]))
+            for r in rows
+        ]
+        return self._embeddings.embed_and_store_batch(triples)
 
     def delete(self, fact_id: int) -> bool:
         cur = self._conn.execute("DELETE FROM repo_facts WHERE id=?", (fact_id,))

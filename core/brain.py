@@ -180,9 +180,10 @@ class Brain:
         task_type: str = "reasoning",
         model_override: str | None = None,
         cycle: int | None = None,
+        query_text: str | None = None,
     ) -> BrainResult:
         status = self.wallet.status()
-        recall = self.memory.recall_for_context(observations)
+        recall = self.memory.recall_for_context(observations, query_text=query_text)
         memory_text = self.memory.format_for_prompt(recall)
 
         model = self.pick_model(task_type, override=model_override)
