@@ -10,6 +10,7 @@ from typing import Any
 from . import config
 from .brain import Brain, BrainResult
 from .expectations import Expectations
+from .repo_schema import RepoSchema
 from .goals import Goals
 from .identity import Identity
 from .journal import Journal
@@ -30,6 +31,7 @@ from tools.development.github_reader import (
 )
 from tools.development.business_pr import GitHubBusinessPR
 from tools.development.self_pr import GitHubProposePR
+from tools.development.write_repo_fact import ReadRepoFacts, WriteRepoFact
 from tools.general.bluesky import BlueskyPost
 from tools.general.bluesky_read import BlueskyRead
 from tools.general.bluesky_engage import BlueskyReply, BlueskySearch
@@ -53,6 +55,7 @@ class Agent:
         self.wallet = Wallet()
         self.memory = Memory()
         self.expectations = Expectations()
+        self.repo_schema = RepoSchema()
         self.identity = Identity()
         self.goals = Goals()
         self.journal = Journal()
@@ -92,6 +95,12 @@ class Agent:
             expectations=self.expectations,
             memory=self.memory,
         ))
+        # Semantic schema layer (architectural memory per repo)
+        self.tools.register(WriteRepoFact(
+            schema=self.repo_schema,
+            get_cycle=lambda: self._cycle,
+        ))
+        self.tools.register(ReadRepoFacts(schema=self.repo_schema))
         # Phase 2 — GitHub (read-only)
         self.tools.register(GitHubListRepos())
         self.tools.register(GitHubRepoInfo())
@@ -245,7 +254,8 @@ class Agent:
         self._check_tier_change(status.tier)
         runway_before = status.runway_days
 
-        observations = self._observe()
+        focus_text = (intent or {}).get("focus") or ""
+        observations = self._observe(focus_text=focus_text)
         if intent:
             observations["self_set_focus"] = intent.get("focus") or None
             observations["self_set_budget"] = intent.get("budget")
@@ -329,7 +339,7 @@ class Agent:
         )
 
     # ---------- observe ----------
-    def _observe(self) -> dict[str, Any]:
+    def _observe(self, focus_text: str = "") -> dict[str, Any]:
         status = self.wallet.status()
         pending_requests = self.requester.pending()
         recent_tx = self.wallet.recent_transactions(limit=5)
@@ -414,6 +424,9 @@ class Agent:
         }
 
         expectations_block = self.expectations.snapshot_for_observations()
+        repo_schemas_block = self.repo_schema.snapshot_for_observations(
+            focus_text=focus_text or None
+        )
 
         return {
             "cycle": self._cycle,
@@ -426,6 +439,7 @@ class Agent:
             },
             "mortality": mortality,
             "expectations": expectations_block,
+            "repo_schemas": repo_schemas_block,
             "inbox": inbox_block,
             "cost_velocity": {
                 "last_5_cycles": recent_metrics,
