@@ -3,10 +3,11 @@
 - wallet_address        — returns the Base tip-jar address. AUTO.
 - usdc_balance_base     — on-chain USDC + ETH-for-gas from Base RPC. AUTO.
 - wallet_history        — itemized burn + earnings + debt event log. AUTO.
-- usdc_send             — outbound USDC transfer. NOTIFY, per-call cap.
-                          Use for x402 pay-per-request, tipping other agents,
-                          etc. Clawback to Mohammad is NOT this tool — that's
-                          scripts/clawback.py, which DAIMON cannot call.
+
+usdc_send is defined below but INTENTIONALLY NOT REGISTERED in core/agent.py.
+DAIMON has no outbound wallet capability — receive-only. All outflows
+(clawback or otherwise) go through scripts/clawback.py, which Mohammad runs
+off-agent. Do not re-register UsdcSend without a conscious decision.
 """
 from __future__ import annotations
 
@@ -66,8 +67,9 @@ class UsdcBalanceBase(BaseTool):
     description = (
         "Check YOUR on-chain USDC balance (and ETH-for-gas balance) on Base. "
         "This is real money — separate from your notional daimon.db wallet. "
-        "Use this before any usdc_send, or to verify a tip / earning actually "
-        "landed, or just to see whether you've earned anything yet."
+        "Use this to verify a tip / earning actually landed, or just to see "
+        "whether you've earned anything yet. Your wallet is receive-only — "
+        "Mohammad handles all outflows off-agent."
     )
     permission_level = PermissionLevel.AUTO
     cost_per_use = 0.0

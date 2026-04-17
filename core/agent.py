@@ -58,7 +58,7 @@ from tools.general.backrooms_tools import (
     BackroomsListCorpus, BackroomsReadLog, BackroomsStats,
 )
 from tools.general.wallet_tools import (
-    WalletAddress, UsdcBalanceBase, WalletHistory, UsdcSend,
+    WalletAddress, UsdcBalanceBase, WalletHistory,
 )
 from tools.income.bounty_tools import BountySweepCentsibles, RecordBountyManual
 from tools.marketing.twitter import TwitterPost, TwitterReadTimeline
@@ -180,7 +180,8 @@ class Agent:
         self.tools.register(WalletAddress())
         self.tools.register(UsdcBalanceBase())
         self.tools.register(WalletHistory(ledger=self.debt_ledger))
-        self.tools.register(UsdcSend(ledger=self.debt_ledger, notifier=self.notifier))
+        # usdc_send intentionally NOT registered — DAIMON has no outbound wallet
+        # capability. All outflows are Mohammad-only via scripts/clawback.py.
         # Phase 6.6 — $10/customer bounty program
         self.tools.register(BountySweepCentsibles(ledger=self.debt_ledger))
         self.tools.register(RecordBountyManual(ledger=self.debt_ledger,
