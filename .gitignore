@@ -12,6 +12,8 @@ venv/
 data/*.db
 data/*.db-journal
 data/simulations/
+data/wallet.keystore.json
+data/wallet.address.txt
 .DS_Store
 .vscode/
 .idea/

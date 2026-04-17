@@ -1,0 +1,43 @@
+[Unit]
+Description=DAIMON (autonomous agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# EDIT THESE TWO LINES to match your Kali user + install path:
+User=CHANGE_ME_USERNAME
+WorkingDirectory=/home/CHANGE_ME_USERNAME/daimon
+
+# Runs the main loop. config.py calls load_dotenv() so .env in
+# WorkingDirectory is picked up automatically — no EnvironmentFile needed.
+ExecStart=/home/CHANGE_ME_USERNAME/daimon/.venv/bin/python /home/CHANGE_ME_USERNAME/daimon/main.py
+
+# Auto-restart if DAIMON crashes or the process exits non-zero.
+# RestartSec gives Anthropic / Bedrock rate limits a breather.
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Let DAIMON buffer stdout to journald — see logs with:
+#   sudo journalctl -u daimon -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=daimon
+
+# Soft resource guardrails for a cheap box. Tune if Kali has more headroom.
+# MemoryMax=1G
+# CPUQuota=80%
+
+# Minor hardening — denies mounting new filesystems, etc. Doesn't block
+# outbound HTTPS or reads/writes under WorkingDirectory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/CHANGE_ME_USERNAME/daimon
+
+[Install]
+WantedBy=multi-user.target

@@ -9,8 +9,12 @@ from typing import Any
 
 from . import config
 from .brain import Brain, BrainResult
+from . import base_wallet
+from .corpus import BackroomsRuns
+from .debt_ledger import DebtLedger
 from .embeddings import EmbeddingService
 from .expectations import Expectations
+from .posts import Posts
 from .repo_schema import RepoSchema
 from .goals import Goals
 from .identity import Identity
@@ -48,6 +52,14 @@ from tools.general.record_outcome import RecordOutcome
 from tools.general.self_control import SetNextCycle
 from tools.general.web_browser import WebBrowser
 from tools.general.web_search import WebSearch
+from tools.general.llama_post import LlamaPost
+from tools.general.backrooms_tools import (
+    BackroomsRun as BackroomsRunTool,
+    BackroomsListCorpus, BackroomsReadLog, BackroomsStats,
+)
+from tools.general.wallet_tools import (
+    WalletAddress, UsdcBalanceBase, WalletHistory, UsdcSend,
+)
 from tools.marketing.twitter import TwitterPost, TwitterReadTimeline
 
 
@@ -69,6 +81,9 @@ class Agent:
         self.brain = Brain(self.wallet, self.memory, dry_run=dry_run)
         self.notifier = TelegramNotifier()
         self.inbox = TelegramInbox()
+        self.posts = Posts()
+        self.backrooms_runs = BackroomsRuns()
+        self.debt_ledger = DebtLedger(self.wallet)
 
         # Backfill embeddings for any rows written before the embedding layer
         # existed. Idempotent — runs every startup, only embeds missing rows.
@@ -154,6 +169,17 @@ class Agent:
         self.tools.register(BlueskyGetProfile())
         self.tools.register(BlueskyEditProfile())
         self.tools.register(BlueskyDeletePost())
+        # Phase 6 — two-brain posting + corpus autonomy
+        self.tools.register(LlamaPost(posts=self.posts, wallet=self.wallet))
+        self.tools.register(BackroomsRunTool(runs=self.backrooms_runs, wallet=self.wallet))
+        self.tools.register(BackroomsListCorpus())
+        self.tools.register(BackroomsReadLog())
+        self.tools.register(BackroomsStats(runs=self.backrooms_runs))
+        # Phase 6.5 — debt + Base wallet
+        self.tools.register(WalletAddress())
+        self.tools.register(UsdcBalanceBase())
+        self.tools.register(WalletHistory(ledger=self.debt_ledger))
+        self.tools.register(UsdcSend(ledger=self.debt_ledger, notifier=self.notifier))
 
     def _load_cycle_counter(self) -> int:
         conn = sqlite3.connect(config.DB_PATH)
@@ -496,6 +522,14 @@ class Agent:
         repo_schemas_block = self.repo_schema.snapshot_for_observations(
             focus_text=focus_text or None
         )
+        # Phase 6.5 — debt + Base wallet status
+        try:
+            base_snap = base_wallet.snapshot() if base_wallet.exists() else None
+        except Exception as e:
+            base_snap = {"status": "error", "error": str(e)[:120]}
+        debt_status_block = self.debt_ledger.snapshot_for_observations(
+            base_wallet_snapshot=base_snap,
+        )
 
         return {
             "cycle": self._cycle,
@@ -507,6 +541,7 @@ class Agent:
                 "tier": status.tier,
             },
             "mortality": mortality,
+            "debt_status": debt_status_block,
             "expectations": expectations_block,
             "repo_schemas": repo_schemas_block,
             "inbox": inbox_block,
