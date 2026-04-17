@@ -6,13 +6,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# EDIT THESE TWO LINES to match your Kali user + install path:
-User=CHANGE_ME_USERNAME
-WorkingDirectory=/home/CHANGE_ME_USERNAME/daimon
+User=alam
+WorkingDirectory=/home/alam/daimon
 
 # Runs the main loop. config.py calls load_dotenv() so .env in
 # WorkingDirectory is picked up automatically — no EnvironmentFile needed.
-ExecStart=/home/CHANGE_ME_USERNAME/daimon/.venv/bin/python /home/CHANGE_ME_USERNAME/daimon/main.py
+ExecStart=/home/alam/daimon/.venv/bin/python /home/alam/daimon/main.py
 
 # Auto-restart if DAIMON crashes or the process exits non-zero.
 # RestartSec gives Anthropic / Bedrock rate limits a breather.
@@ -42,7 +41,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=false
-ReadWritePaths=/home/CHANGE_ME_USERNAME/daimon
+ReadWritePaths=/home/alam/daimon
 
 [Install]
 WantedBy=multi-user.target
