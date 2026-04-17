@@ -21,6 +21,11 @@ RestartSec=30
 StartLimitIntervalSec=600
 StartLimitBurst=10
 
+# Give DAIMON up to 10 minutes to finish the in-flight cycle on stop/restart
+# before systemd SIGKILLs. Its _handle_stop flag just finishes the current
+# cycle cleanly, which can take a few minutes on a deep model.
+TimeoutStopSec=600
+
 # Let DAIMON buffer stdout to journald — see logs with:
 #   sudo journalctl -u daimon -f
 StandardOutput=journal

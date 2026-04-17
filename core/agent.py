@@ -60,6 +60,7 @@ from tools.general.backrooms_tools import (
 from tools.general.wallet_tools import (
     WalletAddress, UsdcBalanceBase, WalletHistory, UsdcSend,
 )
+from tools.income.bounty_tools import BountySweepCentsibles, RecordBountyManual
 from tools.marketing.twitter import TwitterPost, TwitterReadTimeline
 
 
@@ -180,6 +181,10 @@ class Agent:
         self.tools.register(UsdcBalanceBase())
         self.tools.register(WalletHistory(ledger=self.debt_ledger))
         self.tools.register(UsdcSend(ledger=self.debt_ledger, notifier=self.notifier))
+        # Phase 6.6 — $10/customer bounty program
+        self.tools.register(BountySweepCentsibles(ledger=self.debt_ledger))
+        self.tools.register(RecordBountyManual(ledger=self.debt_ledger,
+                                               notifier=self.notifier))
 
     def _load_cycle_counter(self) -> int:
         conn = sqlite3.connect(config.DB_PATH)

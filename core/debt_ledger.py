@@ -163,6 +163,64 @@ class DebtLedger:
             (time.time(), float(amount), blurb, tx_hash or ""),
         )
 
+    # ---------- bounty path ----------
+    # The $10/customer program: Mohammad pays DAIMON $10 for each paying
+    # Centsibles subscriber or First Principles Learning tutoring customer it
+    # brings in. These are credited as 'earning' rows with a `bounty:` prefix
+    # in `details` so every row carries its attribution key (source + customer
+    # id). The prefix is also the idempotency key — re-sweeping Stripe cannot
+    # double-count the same subscriber.
+    BOUNTY_PREFIX = "bounty"
+    BOUNTY_DEFAULT_USD = 10.0
+
+    @staticmethod
+    def _bounty_marker(source: str, customer_id: str) -> str:
+        """Canonical details prefix so we can cheaply detect duplicates."""
+        return f"{DebtLedger.BOUNTY_PREFIX}:{source}:{customer_id}"
+
+    def bounty_already_recorded(self, source: str, customer_id: str) -> bool:
+        marker = self._bounty_marker(source, customer_id)
+        row = self._conn.execute(
+            "SELECT 1 FROM debt_events WHERE kind='earning' "
+            "AND details LIKE ? LIMIT 1",
+            (marker + "%",),
+        ).fetchone()
+        return row is not None
+
+    def record_bounty(self, source: str, customer_id: str,
+                      amount: float = BOUNTY_DEFAULT_USD,
+                      note: str = "") -> dict[str, Any]:
+        """Record a $10 referral bounty. Idempotent on (source, customer_id).
+
+        source: 'centsibles' | 'fpl' | free-form tag
+        customer_id: stripe subscription id, email, handle — any unique key
+        amount: defaults to $10
+
+        Returns {'ok': bool, 'recorded': bool, 'reason': str}. recorded=False
+        with ok=True means it was a duplicate and intentionally skipped.
+        """
+        source = (source or "").strip().lower()
+        customer_id = (customer_id or "").strip()
+        if not source or not customer_id:
+            return {"ok": False, "recorded": False,
+                    "reason": "source and customer_id required"}
+        if amount <= 0:
+            return {"ok": False, "recorded": False, "reason": "amount must be > 0"}
+
+        if self.bounty_already_recorded(source, customer_id):
+            return {"ok": True, "recorded": False,
+                    "reason": f"already credited ({source}:{customer_id})"}
+
+        marker = self._bounty_marker(source, customer_id)
+        details = f"{marker} — {note}".strip(" —") if note else marker
+        self._conn.execute(
+            "INSERT INTO debt_events (ts, kind, amount, details, tx_hash) "
+            "VALUES (?, 'earning', ?, ?, '')",
+            (time.time(), float(amount), details),
+        )
+        return {"ok": True, "recorded": True, "amount": float(amount),
+                "reason": f"credited ${amount:.2f} for {source}:{customer_id}"}
+
     def record_withdrawal(self, amount: float, tx_hash: str = "",
                           details: str = "") -> None:
         """Mohammad clawed back X USDC. Tracked separately so DAIMON sees it
