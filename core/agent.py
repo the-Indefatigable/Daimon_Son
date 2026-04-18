@@ -51,8 +51,10 @@ from tools.general.private_memory import InternMemory, PrivateRecall, PrivateWri
 from tools.general.record_outcome import RecordOutcome
 from tools.general.self_control import SetNextCycle
 from tools.general.web_browser import WebBrowser
+from tools.general.web_read_clean import WebReadClean
 from tools.general.web_search import WebSearch
 from tools.general.llama_post import LlamaPost
+from tools.general.grok_post import GrokPost, GrokStyleReflect
 from tools.general.backrooms_tools import (
     BackroomsRun as BackroomsRunTool,
     BackroomsListCorpus, BackroomsReadLog, BackroomsStats,
@@ -113,6 +115,7 @@ class Agent:
         # Phase 1
         self.tools.register(WebsiteScanner())
         self.tools.register(WebBrowser())
+        self.tools.register(WebReadClean())
         self.tools.register(WebSearch())
         self.tools.register(self.notifier)
         self.tools.register(ReadInbox(inbox=self.inbox))
@@ -172,6 +175,11 @@ class Agent:
         self.tools.register(BlueskyDeletePost())
         # Phase 6 — two-brain posting + corpus autonomy
         self.tools.register(LlamaPost(posts=self.posts, wallet=self.wallet))
+        self.tools.register(GrokPost(posts=self.posts, journal=self.journal,
+                                     wallet=self.wallet))
+        self.tools.register(GrokStyleReflect(posts=self.posts,
+                                             journal=self.journal,
+                                             wallet=self.wallet))
         self.tools.register(BackroomsRunTool(runs=self.backrooms_runs, wallet=self.wallet))
         self.tools.register(BackroomsListCorpus())
         self.tools.register(BackroomsReadLog())

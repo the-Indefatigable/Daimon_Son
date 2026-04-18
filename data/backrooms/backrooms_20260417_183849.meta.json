@@ -1,0 +1,20 @@
+{
+  "run_id": null,
+  "log_path": "/Users/alam/dev/daimon/data/backrooms/backrooms_20260417_183849.txt",
+  "started_ts": 1776469129.634913,
+  "ended_ts": 1776469722.1976562,
+  "turns_requested": 30,
+  "turns_completed": 2,
+  "fresh": false,
+  "status": "interrupted",
+  "error": null,
+  "claude_calls": 1,
+  "claude_tokens_in": 3960,
+  "claude_tokens_out": 2048,
+  "claude_cost_usd": 0.213,
+  "grok_calls": 1,
+  "grok_tokens_in": 4737,
+  "grok_tokens_out": 1441,
+  "grok_cost_usd": 0.035826,
+  "total_cost_usd": 0.248826
+}
