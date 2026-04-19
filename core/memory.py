@@ -1,15 +1,101 @@
 """Persistent memory: episodic (what happened), strategic (what I've learned),
-identity (who I am). SQLite-backed, FTS for recall."""
+identity (who I am). SQLite-backed, FTS for recall.
+
+Human-style fragment recall
+---------------------------
+On top of raw episodic rows, every episode carries a compact *fragment view*:
+  - gist         — 1-2 sentences in DAIMON's own voice (derived from outcome)
+  - key_facts    — 3-5 bullet fragments
+  - surprise     — Bayesian-ish novelty score (0..1) via embedding distance
+  - decay_factor — ACT-R-style forgetting multiplier (0..1), ticks down per cycle
+
+`recall_fragments(query, max_tokens=1200)` returns 3-6 ranked fragments instead of
+a big episodic dump. Ranking combines semantic similarity with surprise (novel
+stuff is more memorable), access_count (habits stay live), and decay (old stuff
+fades). Output format is written in a feral self-note register so Claude mirrors
+the tone DAIMON should be reproducing, not polite English.
+"""
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import config
+
+
+# Rough token estimate: 1 token ~= 4 chars of English. Cheap and conservative
+# enough for sparse-fragment budgeting.
+def _approx_tokens(s: str) -> int:
+    return max(1, len(s) // 4)
+
+
+GIST_MAX_CHARS = 320              # ~80 tokens target
+KEY_FACT_MAX_CHARS = 140          # one-liner
+KEY_FACTS_MAX = 5
+DECAY_PER_CYCLE = 0.95            # ACT-R-inspired forgetting curve
+DECAY_FLOOR = 0.05                # below this, treat as forgotten
+SURPRISE_NOVELTY_WINDOW = 20      # compare new embedding against last N centroids
+DEFAULT_RECALL_K = 6
+DEFAULT_RECALL_MAX_TOKENS = 1200
+
+
+@dataclass
+class MemoryFragment:
+    """Sparse, human-readable episodic trace. Built from the `episodic` row plus
+    fragment-view columns. Never persisted standalone — the `episodic` table IS
+    the storage; this is the lens."""
+    id: int
+    ts: float
+    event_type: str
+    gist: str
+    key_facts: list[str]
+    surprise_score: float
+    decay_factor: float
+    tags: list[str] = field(default_factory=list)
+    tier: str = "st"
+    access_count: int = 0
+    evaluation: str = "unknown"
+
+    def age_human(self, now: float | None = None) -> str:
+        now = now or time.time()
+        delta = max(0.0, now - self.ts)
+        if delta < 3600:
+            return f"{int(delta / 60)}m ago"
+        if delta < 86400:
+            return f"{int(delta / 3600)}h ago"
+        return f"{int(delta / 86400)}d ago"
+
+    def to_prompt_block(self, now: float | None = None) -> str:
+        # Only surface an eval marker when it's a real signal — skip
+        # neutral/unknown so the head line stays clean.
+        marker = {"success": "HIT", "failure": "MISS"}.get(self.evaluation)
+        parts = [f"ep#{self.id}", self.age_human(now)]
+        if marker:
+            parts.append(marker)
+        parts.append(self.event_type)
+        if self.tier == "lt":
+            parts.append("LT")
+        if self.access_count >= 2:
+            parts.append(f"×{self.access_count}")
+        head = " · ".join(parts)
+        lines = [head]
+        gist = (self.gist or "").strip()
+        if gist:
+            lines.append(f'  "{gist}"')
+        for fact in self.key_facts[:KEY_FACTS_MAX]:
+            f = fact.strip()
+            if f:
+                lines.append(f"  - {f}")
+        return "\n".join(lines)
+
+    def token_cost(self) -> int:
+        return _approx_tokens(self.to_prompt_block())
 
 
 class Memory:
@@ -96,7 +182,25 @@ class Memory:
             self._conn.execute(
                 "ALTER TABLE episodic ADD COLUMN access_count INTEGER DEFAULT 0"
             )
+        # Sparse-fragment columns — added 2026-04-18
+        if "gist" not in cols:
+            self._conn.execute("ALTER TABLE episodic ADD COLUMN gist TEXT")
+        if "key_facts" not in cols:
+            self._conn.execute("ALTER TABLE episodic ADD COLUMN key_facts TEXT")
+        if "decay_factor" not in cols:
+            self._conn.execute(
+                "ALTER TABLE episodic ADD COLUMN decay_factor REAL DEFAULT 1.0"
+            )
+        if "surprise_score" not in cols:
+            self._conn.execute(
+                "ALTER TABLE episodic ADD COLUMN surprise_score REAL DEFAULT 0.5"
+            )
+        if "event_type" not in cols:
+            self._conn.execute("ALTER TABLE episodic ADD COLUMN event_type TEXT")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_tier ON episodic(tier)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ep_decay ON episodic(decay_factor)"
+        )
 
     def _ensure_identity(self) -> None:
         defaults = {
@@ -122,18 +226,156 @@ class Memory:
         lesson: str = "",
         tags: list[str] | None = None,
         cycle: int | None = None,
+        gist: str | None = None,
+        key_facts: list[str] | None = None,
+        event_type: str | None = None,
     ) -> int:
         tag_str = ",".join(tags) if tags else ""
+        etype = event_type or self._infer_event_type(action, tags or [])
+        gist_text = gist if gist is not None else self._compute_gist(
+            action=action, outcome=outcome, details=details, lesson=lesson
+        )
+        facts = key_facts if key_facts is not None else self._compute_key_facts(
+            action=action, outcome=outcome, details=details, lesson=lesson
+        )
+        facts_json = json.dumps(facts[:KEY_FACTS_MAX])
+
+        # Compute surprise BEFORE insert so we have the value ready; uses the
+        # embedding of this row compared against the recent centroid.
+        text = self._episodic_text(action, details, outcome, lesson)
+        surprise = self._compute_surprise(text)
+
         cur = self._conn.execute(
-            "INSERT INTO episodic (ts, cycle, action, details, outcome, evaluation, lesson, tags) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), cycle, action, details, outcome, evaluation, lesson, tag_str),
+            "INSERT INTO episodic "
+            "(ts, cycle, action, details, outcome, evaluation, lesson, tags, "
+            " gist, key_facts, decay_factor, surprise_score, event_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?)",
+            (time.time(), cycle, action, details, outcome, evaluation, lesson,
+             tag_str, gist_text, facts_json, surprise, etype),
         )
         ep_id = cur.lastrowid
         if self._embeddings:
-            text = self._episodic_text(action, details, outcome, lesson)
             self._embeddings.embed_and_store("episodic", ep_id, text)
         return ep_id
+
+    # ---------- fragment-view helpers ----------
+    @staticmethod
+    def _infer_event_type(action: str, tags: list[str]) -> str:
+        a = (action or "").lower()
+        tagset = {str(t).lower() for t in tags}
+        if a.startswith("cycle_") or "cycle" in tagset:
+            return "cycle"
+        if "backrooms" in tagset or a.startswith("backrooms"):
+            return "backrooms"
+        if "grok_post" in tagset or "llama_post" in tagset or "bluesky_post" in tagset:
+            return "post"
+        if "read_inbox" in tagset or "mohammad" in tagset or a == "mohammad_reply":
+            return "mohammad_reply"
+        if "tier_change" in tagset or a in ("brain_upgrade", "brain_downgrade"):
+            return "tier_change"
+        if a == "death":
+            return "death"
+        return "event"
+
+    @staticmethod
+    def _compute_gist(action: str, outcome: str, details: str, lesson: str) -> str:
+        """Deterministic gist extraction — first sentence of outcome (DAIMON's own
+        voice) else first chunk of details. Feral register comes from the source
+        text; we don't rewrite."""
+        source = outcome or details or action or ""
+        # Take the first sentence-ish segment.
+        cut = re.split(r"(?<=[.!?])\s+", source.strip(), maxsplit=1)
+        head = cut[0] if cut else source
+        head = head.strip()
+        if len(head) > GIST_MAX_CHARS:
+            head = head[:GIST_MAX_CHARS - 1].rstrip() + "…"
+        if lesson and len(head) + len(lesson) + 4 <= GIST_MAX_CHARS:
+            head = f"{head} // {lesson.strip()}" if head else lesson.strip()
+        return head
+
+    @staticmethod
+    def _compute_key_facts(action: str, outcome: str,
+                           details: str, lesson: str) -> list[str]:
+        """Atomic fragments in DAIMON's own voice when possible.
+
+        Priority: outcome sentences after the first (that's DAIMON actually
+        speaking) → lesson (the distilled takeaway) → details (mostly
+        metadata — boilerplate, skipped when outcome is rich).
+        """
+        facts: list[str] = []
+
+        def _push(chunk: str) -> None:
+            chunk = chunk.strip(" -·•\t")
+            if not chunk:
+                return
+            if len(chunk) > KEY_FACT_MAX_CHARS:
+                chunk = chunk[:KEY_FACT_MAX_CHARS - 1].rstrip() + "…"
+            if chunk and chunk not in facts:
+                facts.append(chunk)
+
+        # Outcome tail — everything after the first sentence (first went to gist)
+        outcome = (outcome or "").strip()
+        tail_sents: list[str] = []
+        if outcome:
+            split = re.split(r"(?<=[.!?])\s+", outcome)
+            if len(split) > 1:
+                tail_sents = split[1:]
+        for sent in tail_sents:
+            if len(facts) >= KEY_FACTS_MAX:
+                break
+            for raw in re.split(r"[;\n]+", sent):
+                if len(facts) >= KEY_FACTS_MAX:
+                    break
+                _push(raw)
+
+        if lesson and len(facts) < KEY_FACTS_MAX:
+            _push(f"lesson: {lesson}")
+
+        # Details only as a last resort — it's usually metadata boilerplate
+        # (observations=[...], tools_used=[...], model=foo).
+        if len(facts) < 2 and details:
+            for raw in re.split(r"[;\n]+", details):
+                if len(facts) >= KEY_FACTS_MAX:
+                    break
+                _push(raw)
+
+        return facts[:KEY_FACTS_MAX]
+
+    def _compute_surprise(self, text: str) -> float:
+        """Novelty-of-event score. High = dissimilar to recent memory = memorable.
+        Falls back to 0.5 when embeddings disabled or no prior history."""
+        if not self._embeddings or not getattr(self._embeddings, "enabled", False):
+            return 0.5
+        if not text or not text.strip():
+            return 0.5
+        try:
+            import numpy as np  # type: ignore
+        except ImportError:
+            return 0.5
+        # Pull recent episodic vectors from the embeddings table via the shared db.
+        rows = self._conn.execute(
+            "SELECT vector, dim FROM embeddings "
+            "WHERE source_table='episodic' "
+            "ORDER BY created_ts DESC LIMIT ?",
+            (SURPRISE_NOVELTY_WINDOW,),
+        ).fetchall()
+        if not rows:
+            return 0.8  # first memories are maximally novel
+        try:
+            new_vec = self._embeddings._embed_call([text], input_type="document")
+        except Exception:
+            return 0.5
+        if not new_vec:
+            return 0.5
+        q = np.asarray(new_vec[0], dtype=np.float32)
+        mat = np.vstack([np.frombuffer(r["vector"], dtype=np.float32) for r in rows])
+        qnorm = float(np.linalg.norm(q)) or 1e-9
+        mnorms = np.linalg.norm(mat, axis=1)
+        mnorms[mnorms == 0] = 1e-9
+        sims = (mat @ q) / (mnorms * qnorm)
+        # Novelty = 1 - max similarity to any recent memory. Clamp to [0,1].
+        novelty = float(max(0.0, min(1.0, 1.0 - float(sims.max()))))
+        return round(novelty, 4)
 
     @staticmethod
     def _episodic_text(action: str, details: str, outcome: str, lesson: str) -> str:
@@ -158,9 +400,11 @@ class Memory:
 
     # ---------- tiering (human-like memory) ----------
     def touch_episode(self, episode_id: int) -> None:
-        """DAIMON recalled this. If accessed 3+ times, auto-promote to long-term."""
+        """DAIMON recalled this. Bump access, reset decay (just-accessed = live),
+        auto-promote to long-term at the 3-recall habit threshold."""
         self._conn.execute(
-            "UPDATE episodic SET access_count = access_count + 1 WHERE id = ?",
+            "UPDATE episodic SET access_count = access_count + 1, "
+            "decay_factor = MIN(1.0, decay_factor + 0.3) WHERE id = ?",
             (episode_id,),
         )
         row = self._conn.execute(
@@ -168,8 +412,20 @@ class Memory:
         ).fetchone()
         if row and row["tier"] == "st" and row["access_count"] >= 3:
             self._conn.execute(
-                "UPDATE episodic SET tier='lt' WHERE id = ?", (episode_id,)
+                "UPDATE episodic SET tier='lt', decay_factor=1.0 WHERE id = ?",
+                (episode_id,),
             )
+
+    # ---------- natural forgetting (ACT-R-style decay) ----------
+    def decay_step(self, factor: float = DECAY_PER_CYCLE) -> int:
+        """Apply one cycle of forgetting to short-term memories. Long-term is
+        preserved. Returns rows affected."""
+        cur = self._conn.execute(
+            "UPDATE episodic SET decay_factor = MAX(?, decay_factor * ?) "
+            "WHERE tier='st'",
+            (DECAY_FLOOR, factor),
+        )
+        return cur.rowcount or 0
 
     def intern_episode(self, episode_id: int, reason: str = "") -> bool:
         """DAIMON explicitly promotes something to long-term memory (habit)."""
@@ -302,23 +558,202 @@ class Memory:
             (key, value),
         )
 
+    # ---------- sparse fragment recall (human-style) ----------
+    def _row_to_fragment(self, row: sqlite3.Row | dict) -> MemoryFragment:
+        """Hydrate a fragment from an episodic row. Computes gist/key_facts on
+        the fly for pre-fragment rows that have NULL in those columns."""
+        r = dict(row)
+        gist = r.get("gist") or self._compute_gist(
+            r.get("action") or "", r.get("outcome") or "",
+            r.get("details") or "", r.get("lesson") or "",
+        )
+        key_facts_raw = r.get("key_facts")
+        if key_facts_raw:
+            try:
+                facts = list(json.loads(key_facts_raw))
+            except Exception:
+                facts = [str(key_facts_raw)[:KEY_FACT_MAX_CHARS]]
+        else:
+            facts = self._compute_key_facts(
+                r.get("action") or "", r.get("outcome") or "",
+                r.get("details") or "", r.get("lesson") or "",
+            )
+        tags_raw = r.get("tags") or ""
+        tags = [t for t in tags_raw.split(",") if t] if isinstance(tags_raw, str) else []
+        event_type = r.get("event_type") or self._infer_event_type(
+            r.get("action") or "", tags,
+        )
+        return MemoryFragment(
+            id=int(r["id"]),
+            ts=float(r["ts"]),
+            event_type=event_type,
+            gist=gist,
+            key_facts=[str(f) for f in facts],
+            surprise_score=float(r.get("surprise_score") or 0.5),
+            decay_factor=float(r.get("decay_factor") or 1.0),
+            tags=tags,
+            tier=str(r.get("tier") or "st"),
+            access_count=int(r.get("access_count") or 0),
+            evaluation=str(r.get("evaluation") or "unknown"),
+        )
+
+    def recall_fragments(
+        self,
+        query: str = "",
+        k: int = DEFAULT_RECALL_K,
+        max_tokens: int = DEFAULT_RECALL_MAX_TOKENS,
+        tag: str | None = None,
+        include_long_term: bool = True,
+        touch: bool = True,
+    ) -> list[MemoryFragment]:
+        """Return up to `k` sparse fragments, capped at `max_tokens` total.
+
+        Ranking = semantic_similarity × decay_factor × surprise_boost × habit_boost.
+        When embeddings are disabled or query is empty, falls back to a
+        recency+decay ranking over short-term rows.
+
+        `touch=True` bumps access_count + refreshes decay on every returned
+        fragment — recalling IS a form of reinforcement. Pass touch=False for
+        read-only introspection.
+        """
+        candidates: dict[int, tuple[float, sqlite3.Row]] = {}
+
+        # Semantic pool: Voyage-embedding similarity.
+        use_semantic = (
+            bool(query) and self._embeddings
+            and getattr(self._embeddings, "enabled", False)
+        )
+        if use_semantic:
+            hits = self._embeddings.search(
+                query=query,
+                k=max(12, k * 4),
+                source_tables=["episodic"],
+                min_similarity=0.30,
+            )
+            if hits:
+                ids = [int(h["source_id"]) for h in hits]
+                sim_by_id = {int(h["source_id"]): float(h["similarity"]) for h in hits}
+                placeholders = ",".join("?" for _ in ids)
+                rows = self._conn.execute(
+                    f"SELECT * FROM episodic WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                for r in rows:
+                    candidates[r["id"]] = (sim_by_id.get(r["id"], 0.0), r)
+
+        # Recency pool: a few latest rows always present so DAIMON isn't blind to
+        # what just happened.
+        recency_rows = self._conn.execute(
+            "SELECT * FROM episodic "
+            "WHERE (? = '' OR tags LIKE ?) "
+            "ORDER BY ts DESC LIMIT ?",
+            (tag or "", f"%{tag}%" if tag else "", max(6, k)),
+        ).fetchall()
+        for r in recency_rows:
+            if r["id"] not in candidates:
+                # Seed with a modest similarity so recency can compete.
+                candidates[r["id"]] = (0.35, r)
+
+        # Long-term seed: carry a sample of the most-accessed LT rows so habits
+        # stay visible when relevant.
+        if include_long_term:
+            lt_rows = self._conn.execute(
+                "SELECT * FROM episodic WHERE tier='lt' "
+                "ORDER BY access_count DESC, ts DESC LIMIT ?",
+                (max(3, k // 2),),
+            ).fetchall()
+            for r in lt_rows:
+                if r["id"] not in candidates:
+                    candidates[r["id"]] = (0.30, r)
+
+        if not candidates:
+            return []
+
+        # Rank: similarity × decay × (1 + 0.3·surprise) × (1 + 0.08·log(1+access))
+        import math
+        scored: list[tuple[float, sqlite3.Row]] = []
+        now = time.time()
+        for rid, (sim, row) in candidates.items():
+            decay = float(row["decay_factor"] or 1.0)
+            if decay < DECAY_FLOOR and row["tier"] != "lt":
+                continue  # forgotten
+            surprise = float(row["surprise_score"] or 0.5)
+            access = int(row["access_count"] or 0)
+            # Mild recency lift on top of decay so fresh events aren't ignored.
+            age_days = max(0.0, (now - float(row["ts"])) / 86400.0)
+            recency_lift = math.exp(-age_days / 30.0) * 0.15
+            score = (sim * decay
+                     * (1.0 + 0.30 * surprise)
+                     * (1.0 + 0.08 * math.log1p(access))
+                     + recency_lift)
+            scored.append((score, row))
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+
+        # Token-budgeted selection.
+        chosen: list[MemoryFragment] = []
+        used_tokens = 0
+        for _score, row in scored:
+            if len(chosen) >= k:
+                break
+            frag = self._row_to_fragment(row)
+            cost = frag.token_cost()
+            if used_tokens + cost > max_tokens and chosen:
+                break
+            chosen.append(frag)
+            used_tokens += cost
+
+        if touch:
+            for frag in chosen:
+                self.touch_episode(frag.id)
+
+        return chosen
+
+    def format_fragments_for_prompt(
+        self,
+        fragments: list[MemoryFragment],
+        header: str = "FRAGMENTS (what you remember — sparse, human-style)",
+    ) -> str:
+        """Render fragments as feral self-notes, NOT as a database table.
+        The register here matters: Claude mirrors whatever tone it sees in
+        its own memory block."""
+        if not fragments:
+            return f"{header}:\n  (nothing strongly relevant — you're operating on instinct this cycle)"
+        now = time.time()
+        blocks = [f.to_prompt_block(now=now) for f in fragments]
+        body = "\n---\n".join(blocks)
+        footer = (f"(recall_fragments for more — these were picked by relevance × "
+                  f"novelty × habit-strength × decay)")
+        return f"{header}:\n{body}\n{footer}"
+
     # ---------- recall ----------
     def recall_for_context(self, observations: dict, limit_episodes: int = 5,
-                           limit_strategic: int = 5,
+                           limit_strategic: int = 3,
                            query_text: str | None = None,
-                           k_semantic: int = 6) -> dict[str, Any]:
-        """Assemble the memory slice to inject into this cycle's prompt.
+                           k_semantic: int = 6,
+                           fragment_k: int = 3,
+                           fragment_max_tokens: int = 650) -> dict[str, Any]:
+        """Assemble the sparse, human-style memory slice for this cycle.
 
-        If query_text + an embedding service are available, augment with
-        semantically-relevant rows from across episodic / strategic / repo_facts.
-        Falls back cleanly to the keyword path when either is missing.
+        Default is now tight: identity + ~3 highly-relevant fragments + top-3
+        strategic insights + last reflection pointer. DAIMON pulls deeper recall
+        itself via the `recall_fragments` tool — just like a human pausing to
+        *try* to remember something instead of receiving a full transcript.
         """
-        recent = self.recent_episodes(limit=limit_episodes)
-        keywords = [str(k) for k in observations.keys()][:5]
+        # Sparse fragments — the backbone of the new memory block.
+        fragments = self.recall_fragments(
+            query=query_text or "",
+            k=fragment_k,
+            max_tokens=fragment_max_tokens,
+            touch=False,  # auto-inject shouldn't count as active recall
+        )
+
+        # Strategic insights: a small number of high-confidence ones only.
+        keywords = [str(k) for k in observations.keys()][:3]
         strategic: list[dict] = []
         seen: set[int] = set()
         for kw in keywords:
-            for row in self.top_strategic(category=kw, limit=3):
+            for row in self.top_strategic(category=kw, limit=2):
                 if row["id"] not in seen:
                     strategic.append(row)
                     seen.add(row["id"])
@@ -330,21 +765,10 @@ class Memory:
                     if len(strategic) >= limit_strategic:
                         break
 
-        semantic_hits: list[dict] = []
-        if query_text and self._embeddings and self._embeddings.enabled:
-            raw_hits = self._embeddings.search(
-                query=query_text,
-                k=k_semantic,
-                source_tables=["episodic", "strategic", "repo_facts"],
-                min_similarity=0.35,
-            )
-            semantic_hits = self._hydrate_hits(raw_hits)
-
         return {
             "identity": self.identity(),
-            "recent_episodes": recent,
+            "fragments": fragments,
             "strategic_insights": strategic[:limit_strategic],
-            "semantic_hits": semantic_hits,
             "last_reflection": self.last_reflection(),
         }
 
@@ -466,57 +890,49 @@ class Memory:
         return cur.lastrowid
 
     def format_for_prompt(self, recall: dict[str, Any]) -> str:
+        """Render the sparse memory block. Everything here mirrors the register
+        Claude should reproduce — short, punchy, fragment-style, not corporate.
+        Deeper recall is a TOOL CALL away, not a free dump."""
         parts: list[str] = []
         ident = recall.get("identity", {})
         if ident:
-            parts.append("IDENTITY:")
-            for k, v in ident.items():
-                parts.append(f"  - {k}: {v}")
-        semantic = recall.get("semantic_hits") or []
-        if semantic:
-            parts.append("\nSEMANTICALLY-RELEVANT MEMORIES (matched to what you're "
-                         "thinking about right now — use these before searching again):")
-            for h in semantic:
-                sim = h.get("similarity", 0)
-                if h["kind"] == "episode":
-                    parts.append(
-                        f"  · [ep#{h['id']} sim={sim:.2f}] {h['action']}: "
-                        f"{h['summary']}"
-                        + (f" — LESSON: {h['lesson']}" if h.get('lesson') else "")
-                    )
-                elif h["kind"] == "strategic":
-                    parts.append(
-                        f"  · [strat#{h['id']} sim={sim:.2f} category={h['category']} "
-                        f"conf={h['confidence']}] {h['insight']}"
-                    )
-                elif h["kind"] == "repo_fact":
-                    parts.append(
-                        f"  · [repo#{h['id']} sim={sim:.2f} {h['repo']}/"
-                        f"{h['category']}/{h['key']}] {h['body']}"
-                    )
+            ident_line = " · ".join(f"{k}: {v}" for k, v in ident.items()
+                                    if k in ("name", "mood", "personality"))
+            # Compact identity — 1 line instead of bullet list. Full self-model
+            # already lives in the cacheable YOUR CURRENT SELF-MODEL block.
+            parts.append(f"IDENTITY: {ident_line}" if ident_line
+                         else "IDENTITY: (see self-model block above)")
+
+        fragments = recall.get("fragments") or []
+        parts.append("")
+        parts.append(self.format_fragments_for_prompt(fragments))
+
         strategic = recall.get("strategic_insights") or []
         if strategic:
-            parts.append("\nSTRATEGIC INSIGHTS (things I've learned):")
-            for s in strategic:
+            parts.append("\nLIVE HEURISTICS (things I trust enough to bet on):")
+            for s in strategic[:3]:
+                conf = s.get("confidence", 0.0) or 0.0
                 parts.append(
-                    f"  - [{s['category']}] {s['insight']} "
-                    f"(confidence {s['confidence']:.2f}, evidence x{s['evidence_count']})"
+                    f"  · {s['insight']} "
+                    f"[{s['category']} · conf {conf:.2f} · x{s['evidence_count']}]"
                 )
-        recent = recall.get("recent_episodes") or []
-        if recent:
-            parts.append("\nRECENT EPISODES:")
-            for e in recent:
-                ts = datetime.fromtimestamp(e["ts"], tz=timezone.utc).isoformat(timespec="minutes")
-                eval_marker = {"success": "✓", "failure": "✗", "neutral": "·",
-                               "unknown": "?"}.get(e["evaluation"], "?")
-                lesson = f" — LESSON: {e['lesson']}" if e["lesson"] else ""
-                parts.append(f"  {eval_marker} [{ts}] {e['action']}: {e['outcome'] or e['details']}{lesson}")
+
         refl = recall.get("last_reflection")
         if refl:
-            parts.append(f"\nLAST REFLECTION ({datetime.fromtimestamp(refl['ts']).isoformat(timespec='minutes')}):")
-            parts.append(f"  {refl['summary']}")
-            if refl.get("next_actions"):
-                parts.append(f"  Next actions: {refl['next_actions']}")
+            when = datetime.fromtimestamp(
+                refl['ts'], tz=timezone.utc
+            ).isoformat(timespec='minutes')
+            parts.append(f"\nLAST REFLECTION ({when}):")
+            summary = (refl.get("summary") or "").strip()
+            # Reflections are already DAIMON's voice — take just the first line
+            # to keep the block sparse; tool-call for the full text if needed.
+            first_line = summary.split("\n", 1)[0][:280]
+            if first_line:
+                parts.append(f"  {first_line}")
+            nxt = (refl.get("next_actions") or "").strip()
+            if nxt:
+                parts.append(f"  next: {nxt[:220]}")
+
         return "\n".join(parts) if parts else "(memory is empty — first cycle)"
 
     def close(self) -> None:

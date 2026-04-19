@@ -46,6 +46,7 @@ from tools.general.bluesky_actions import (
 from tools.general.bluesky_engage import BlueskyReply, BlueskySearch
 from tools.general.expect_result import ExpectResult
 from tools.general.inbox import ReadInbox
+from tools.general.memory_recall import RecallFragments
 from tools.general.notifier import TelegramNotifier
 from tools.general.private_memory import InternMemory, PrivateRecall, PrivateWrite
 from tools.general.record_outcome import RecordOutcome
@@ -123,6 +124,7 @@ class Agent:
         self.tools.register(PrivateWrite(memory=self.memory))
         self.tools.register(PrivateRecall(memory=self.memory))
         self.tools.register(InternMemory(memory=self.memory))
+        self.tools.register(RecallFragments(memory=self.memory))
         # Prediction-error encoding (time-awareness + memory salience)
         self.tools.register(ExpectResult(
             expectations=self.expectations,
@@ -322,6 +324,15 @@ class Agent:
         status = self.wallet.status()
         self._check_tier_change(status.tier)
         runway_before = status.runway_days
+
+        # ACT-R-style forgetting tick: every cycle, short-term fragment decay
+        # nudges down so unused memories fade from recall ranking while
+        # long-term (interned) memories stay crisp. Recalls refresh decay
+        # back up — human-style use-it-or-lose-it.
+        try:
+            self.memory.decay_step()
+        except Exception as e:
+            self._print(f"[decay_step failed: {e}]")
 
         focus_text = (intent or {}).get("focus") or ""
         observations = self._observe(focus_text=focus_text)
