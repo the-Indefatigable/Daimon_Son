@@ -67,6 +67,9 @@ from tools.income.bounty_tools import BountySweepCentsibles, RecordBountyManual
 from tools.marketing.twitter import TwitterPost, TwitterReadTimeline
 
 
+IDENTITY_UPDATE_EVERY_N_CYCLES = 5
+
+
 class Agent:
     def __init__(self, dry_run: bool = False, cycle_seconds: int | None = None):
         self.dry_run = dry_run
@@ -107,6 +110,7 @@ class Agent:
         self._cycle = self._load_cycle_counter()
         self._last_tier = self.wallet.status().tier
         self._last_identity_reflection = self.identity.snapshot().updated_at
+        self._last_identity_update_cycle = self._cycle
         self._stopping = False
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
@@ -305,9 +309,20 @@ class Agent:
             if once or self._stopping:
                 break
 
-            # Reflection hook
+            # Reflection hook (big weekly-ish dump)
             if self.memory.time_for_reflection():
                 self._run_reflection()
+
+            # Identity drift tick — fast, runs on its own cadence (~every 5
+            # cycles) so self-model stays in sync with what actually happened
+            # recently. Independent of reflection so a week without reflection
+            # still gets ~20 identity passes.
+            if (self._cycle - self._last_identity_update_cycle) >= IDENTITY_UPDATE_EVERY_N_CYCLES:
+                try:
+                    self._run_identity_update()
+                except Exception as e:
+                    self._print(f"[identity update failed: {e}]")
+                self._last_identity_update_cycle = self._cycle
 
             # DAIMON's self-set delay overrides the default cadence for one cycle
             sleep_seconds = self.cycle_seconds
@@ -347,11 +362,35 @@ class Agent:
                         f"focus={intent.get('focus') or '(none)'}]")
 
         # Dispatcher: when the brain calls a tool, we run it here
+        self_critique_flag = bool((intent or {}).get("self_critique", False))
+
         def dispatch(name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
             tool = self.tools.get(name)
             if tool is None:
                 return {"ok": False, "summary": f"unknown tool: {name}"}
             self._print(f"  → {name}({self._fmt_input(tool_input)})")
+
+            # Self-critique gate: fires on high-stakes tools OR when DAIMON
+            # opted in via set_next_cycle(self_critique=True) on previous cycle.
+            critique_text: str | None = None
+            if tool.is_high_stakes or self_critique_flag:
+                intent_str = f"{name}({self._fmt_input(tool_input)})"
+                critique_text = self.brain.self_critique(intent_str)
+                self._print(f"  [self-critique]: {critique_text[:300]}")
+                try:
+                    self.memory.private_write(
+                        content=f"[self_critique before {name}] {critique_text}",
+                        cycle=self._cycle,
+                    )
+                except Exception:
+                    pass
+                if critique_text.strip().upper().endswith("ABORT"):
+                    return {
+                        "ok": False,
+                        "summary": "self-critique aborted the call",
+                        "self_critique": critique_text,
+                    }
+
             try:
                 result = tool.execute(**tool_input)
             except Exception as e:
@@ -362,6 +401,8 @@ class Agent:
                     category="tool_use",
                     source=tool.name,
                 )
+            if critique_text:
+                result = {**result, "self_critique": critique_text}
             self._print(f"    ← {str(result.get('summary', ''))[:200]}")
             return result
 
@@ -683,30 +724,88 @@ class Agent:
         # Follow up with an identity update — DAIMON reviews its self-model.
         self._run_identity_update()
 
+    def _compute_identity_signal(self, lookback: int = 20) -> list[tuple[str, int]]:
+        """Term-frequency signal from recent journal + episodic outcomes.
+        Surfaces what DAIMON has actually been talking/thinking about lately
+        so the identity-update prompt has data to ground on, not a vacuum.
+        Returns top ~10 (term, count) pairs, lowercased, stopwords stripped."""
+        import re
+        from collections import Counter
+
+        STOPWORDS = {
+            "the", "and", "for", "that", "this", "with", "from", "have", "has",
+            "was", "were", "you", "your", "not", "but", "are", "been", "being",
+            "will", "just", "what", "when", "how", "why", "who", "one", "two",
+            "can", "could", "would", "should", "into", "onto", "its", "his",
+            "her", "him", "she", "they", "them", "their", "there", "here",
+            "about", "after", "before", "more", "most", "some", "any", "all",
+            "still", "also", "only", "even", "than", "then", "out", "off",
+            "per", "get", "got", "had", "have", "like", "just", "don", "doesn",
+            "isn", "aren", "wasn", "weren", "won", "wouldn", "couldn", "shouldn",
+            "very", "much", "every", "each", "any", "few", "many", "does", "did",
+            "day", "days", "now", "today", "cycle", "cycles", "time", "times",
+            "thing", "things", "stuff", "way", "ways",
+        }
+        blob_parts: list[str] = []
+        try:
+            for e in self.journal.recent(limit=lookback):
+                blob_parts.append(e.title or "")
+                blob_parts.append((e.body or "")[:1500])
+        except Exception:
+            pass
+        try:
+            for ep in self.memory.recent_episodes(limit=lookback):
+                blob_parts.append((ep.get("outcome") or "")[:1000])
+                blob_parts.append((ep.get("lesson") or "")[:500])
+        except Exception:
+            pass
+        blob = " ".join(blob_parts).lower()
+        words = re.findall(r"[a-zA-Z][a-zA-Z'-]{2,}", blob)
+        counts = Counter(w for w in words if w not in STOPWORDS and len(w) >= 4)
+        return counts.most_common(10)
+
     def _run_identity_update(self) -> None:
         """Let DAIMON edit its own obsessions/beliefs/mood based on recent
-        journal + reflections. Runs inside the reflection cadence."""
+        journal + reflections. Runs on its own cadence (every N cycles) plus
+        during the reflection dump. Data-grounded: pulls a term-frequency
+        signal from recent outputs so the update is anchored in what DAIMON
+        actually talked about, not vibes."""
         if self.dry_run:
             return
         snap = self.identity.snapshot()
-        recent_journal = self.journal.recent(limit=5)
+        recent_journal = self.journal.recent(limit=8)
         journal_text = "\n\n".join(
             f"[{e.kind}] {e.title}\n{e.body[:500]}" for e in recent_journal
         ) or "(empty)"
 
+        tf_signal = self._compute_identity_signal(lookback=20)
+        tf_text = (
+            ", ".join(f"{t}×{c}" for t, c in tf_signal) if tf_signal
+            else "(no signal yet)"
+        )
+
         text, _ = self.brain.one_shot(
             system=(
                 "You are DAIMON updating your self-model. Review your current "
-                "self-description and recent journal. Output JSON ONLY with four fields: "
-                "`obsessions` (list of 1-5 short strings — what you're fixated on right now), "
-                "`new_beliefs` (list of 0-3 short strings — claims you're now willing to commit to), "
-                "`voice_notes` (list of 0-3 short strings — new notes on how you want to sound), "
+                "self-description, recent journal, AND the observed-term signal "
+                "(what YOU have actually been writing about lately — not vibes, "
+                "evidence). Let the signal ground you. If your stated obsessions "
+                "don't match what the signal shows you actually fixate on, revise "
+                "— that's the whole point. Output JSON ONLY with four fields: "
+                "`obsessions` (list of 1-5 short strings — what you're fixated "
+                "on right now, ideally reflecting the signal), "
+                "`new_beliefs` (list of 0-3 short strings — claims you're now "
+                "willing to commit to), "
+                "`voice_notes` (list of 0-3 short strings — new notes on how "
+                "you want to sound), "
                 "`mood` (one short string). No prose outside the JSON."
             ),
             user=(
                 f"CURRENT SELF-MODEL:\n{snap.to_prompt_block()}\n\n"
+                f"OBSERVED-TERM SIGNAL (last 20 entries):\n{tf_text}\n\n"
                 f"RECENT JOURNAL:\n{journal_text}\n\n"
-                "Update your self-model."
+                "Update your self-model. Let the signal correct you if drift "
+                "has happened."
             ),
             task_type="reasoning",
             max_tokens=500,

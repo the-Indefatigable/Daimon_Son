@@ -60,6 +60,19 @@ class SetNextCycle(BaseTool):
                     "type": "string",
                     "description": "Why you chose this. Recorded for later reflection.",
                 },
+                "self_critique": {
+                    "type": "boolean",
+                    "description": (
+                        "Turn on questioning for your NEXT cycle. When true, every "
+                        "tool call goes through a fast hostile-critic pass (a short "
+                        "'what could go wrong?' paragraph) before it runs. The "
+                        "critique is prepended to the tool result you see. Use this "
+                        "when you suspect you're on autopilot, when a cycle feels "
+                        "important, or after a visible mistake. Orthogonal to budget "
+                        "— composable with any tier. Default false; it costs extra "
+                        "Haiku calls per tool so don't leave it on forever."
+                    ),
+                },
             },
             "required": ["budget", "delay_minutes", "focus", "reason"],
         }
@@ -74,6 +87,7 @@ class SetNextCycle(BaseTool):
 
         focus = str(kwargs.get("focus", "")).strip()[:500]
         reason = str(kwargs.get("reason", "")).strip()[:500]
+        self_critique = bool(kwargs.get("self_critique", False))
 
         intent = {
             "budget": budget,
@@ -81,6 +95,7 @@ class SetNextCycle(BaseTool):
             "delay_minutes": delay,
             "focus": focus,
             "reason": reason,
+            "self_critique": self_critique,
             "set_at": time.time(),
         }
 
@@ -97,11 +112,14 @@ class SetNextCycle(BaseTool):
         conn.commit()
         conn.close()
 
+        summary = (
+            f"next cycle queued: budget={budget}, delay={delay}min, "
+            f"focus={'(none)' if not focus else focus[:80]}"
+        )
+        if self_critique:
+            summary += " [self-critique ON]"
         return {
             "ok": True,
-            "summary": (
-                f"next cycle queued: budget={budget}, "
-                f"delay={delay}min, focus={'(none)' if not focus else focus[:80]}"
-            ),
+            "summary": summary,
             "intent": intent,
         }

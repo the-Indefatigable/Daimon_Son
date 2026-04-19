@@ -38,6 +38,7 @@ def _allowlist() -> list[str]:
 
 class GitHubBusinessPR(BaseTool):
     name = "github_business_pr"
+    is_high_stakes = True
     description = (
         "Propose a change to one of Mohammad's business repos by opening a pull "
         "request. You have write access ONLY to repos in the allowlist (currently "

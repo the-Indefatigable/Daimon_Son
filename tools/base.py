@@ -15,6 +15,7 @@ class BaseTool(ABC):
     description: str = ""
     permission_level: PermissionLevel = PermissionLevel.AUTO
     cost_per_use: float = 0.0  # estimated USD per execute() call
+    is_high_stakes: bool = False  # if True, dispatch runs self_critique first
 
     @abstractmethod
     def input_schema(self) -> dict[str, Any]:

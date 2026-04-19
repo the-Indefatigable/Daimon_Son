@@ -188,6 +188,7 @@ class BountySweepCentsibles(BaseTool):
 
 class RecordBountyManual(BaseTool):
     name = "record_bounty_manual"
+    is_high_stakes = True
     description = (
         "Claim a $10 bounty for a First Principles Learning tutoring customer "
         "(or any referral Stripe can't see). Use this ONLY when you have "

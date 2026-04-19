@@ -44,6 +44,7 @@ def _flatten(data: dict[str, Any], prefix: str = "") -> dict[str, str]:
 
 class StripeCatalog(BaseTool):
     name = "stripe_catalog"
+    is_high_stakes = True
     description = (
         "Read/write Centsibles' product catalog: list products & prices, create "
         "a new price (e.g., for a pricing experiment), create a promo code or "

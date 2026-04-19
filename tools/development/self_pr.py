@@ -32,6 +32,7 @@ def _headers(token: str) -> dict[str, str]:
 
 class GitHubProposePR(BaseTool):
     name = "github_propose_pr"
+    is_high_stakes = True
     description = (
         "Propose a change to your OWN codebase (the daimon repo) by opening a "
         "pull request. Mohammad reviews and merges. You cannot merge yourself. "
